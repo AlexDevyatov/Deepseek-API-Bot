@@ -19,10 +19,34 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
+# Определяем директорию, где находится скрипт
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+
 # Переменные
 APP_DIR="/opt/aibot"
 SERVICE_USER="www-data"
+SERVICE_NAME="aibot"
 SERVICE_FILE="aibot.service"
+
+# Проверяем наличие необходимых файлов
+echo -e "${YELLOW}Проверка наличия файлов проекта...${NC}"
+REQUIRED_FILES=("bot.py" "deepseek_client.py" "requirements.txt" "aibot.service")
+MISSING_FILES=()
+
+for file in "${REQUIRED_FILES[@]}"; do
+    if [ ! -f "$SCRIPT_DIR/$file" ]; then
+        MISSING_FILES+=("$file")
+    fi
+done
+
+if [ ${#MISSING_FILES[@]} -ne 0 ]; then
+    echo -e "${RED}Ошибка: Не найдены следующие файлы:${NC}"
+    for file in "${MISSING_FILES[@]}"; do
+        echo -e "${RED}  - $file${NC}"
+    done
+    echo -e "${YELLOW}Убедитесь, что вы запускаете скрипт из директории проекта.${NC}"
+    exit 1
+fi
 
 # Создаем директорию приложения
 echo -e "${YELLOW}Создание директории приложения...${NC}"
@@ -30,7 +54,7 @@ mkdir -p $APP_DIR
 
 # Копируем файлы проекта
 echo -e "${YELLOW}Копирование файлов проекта...${NC}"
-cp bot.py deepseek_client.py requirements.txt $APP_DIR/
+cp "$SCRIPT_DIR/bot.py" "$SCRIPT_DIR/deepseek_client.py" "$SCRIPT_DIR/requirements.txt" $APP_DIR/
 chown -R $SERVICE_USER:$SERVICE_USER $APP_DIR
 
 # Проверяем наличие tokens.txt
@@ -63,18 +87,22 @@ fi
 # Создаем виртуальное окружение
 echo -e "${YELLOW}Создание виртуального окружения...${NC}"
 cd $APP_DIR
-sudo -u $SERVICE_USER python3 -m venv .venv
+if [ -d ".venv" ]; then
+    echo -e "${YELLOW}Виртуальное окружение уже существует, пропускаем создание...${NC}"
+else
+    sudo -u $SERVICE_USER python3 -m venv .venv
+fi
 
 # Устанавливаем зависимости
 echo -e "${YELLOW}Установка зависимостей...${NC}"
-sudo -u $SERVICE_USER $APP_DIR/.venv/bin/pip install --upgrade pip
-sudo -u $SERVICE_USER $APP_DIR/.venv/bin/pip install -r $APP_DIR/requirements.txt
+sudo -u $SERVICE_USER $APP_DIR/.venv/bin/pip install --upgrade pip --quiet
+sudo -u $SERVICE_USER $APP_DIR/.venv/bin/pip install -r $APP_DIR/requirements.txt --quiet
 
 # Копируем и настраиваем systemd service
 echo -e "${YELLOW}Настройка systemd service...${NC}"
-cp $SERVICE_FILE /etc/systemd/system/
+cp "$SCRIPT_DIR/$SERVICE_FILE" /etc/systemd/system/
 systemctl daemon-reload
-systemctl enable $SERVICE_FILE
+systemctl enable $SERVICE_NAME
 
 echo -e "${GREEN}=========================================="
 echo "Развертывание завершено!"
