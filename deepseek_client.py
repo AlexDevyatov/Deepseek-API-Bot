@@ -6,8 +6,45 @@
 import os
 from openai import OpenAI
 
-# API ключ
-API_KEY = "sk-ca44e59da3804de68a0435bb15e57631"
+
+def load_tokens():
+    """
+    Загружает токены из файла tokens.txt
+    
+    Returns:
+        dict: Словарь с токенами
+    """
+    tokens = {}
+    tokens_file = "tokens.txt"
+    
+    if not os.path.exists(tokens_file):
+        raise FileNotFoundError(
+            f"Файл {tokens_file} не найден! "
+            f"Создайте файл {tokens_file} с содержимым:\n"
+            f"DEEPSEEK_API_KEY=your_deepseek_api_key"
+        )
+    
+    with open(tokens_file, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith('#') and '=' in line:
+                key, value = line.split('=', 1)
+                tokens[key.strip()] = value.strip()
+    
+    return tokens
+
+
+# Загружаем токены
+try:
+    tokens = load_tokens()
+    API_KEY = tokens.get('DEEPSEEK_API_KEY')
+    
+    if not API_KEY:
+        raise ValueError("DEEPSEEK_API_KEY не найден в tokens.txt")
+except (FileNotFoundError, ValueError) as e:
+    print(f"Ошибка: {e}")
+    raise
+
 BASE_URL = "https://api.deepseek.com"
 
 # Создаем клиент

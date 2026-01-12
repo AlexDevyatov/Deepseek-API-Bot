@@ -16,10 +16,51 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+def load_tokens():
+    """
+    Загружает токены из файла tokens.txt
+    
+    Returns:
+        dict: Словарь с токенами
+    """
+    tokens = {}
+    tokens_file = "tokens.txt"
+    
+    if not os.path.exists(tokens_file):
+        raise FileNotFoundError(
+            f"Файл {tokens_file} не найден! "
+            f"Создайте файл {tokens_file} с содержимым:\n"
+            f"DEEPSEEK_API_KEY=your_deepseek_api_key\n"
+            f"TELEGRAM_BOT_TOKEN=your_telegram_bot_token"
+        )
+    
+    with open(tokens_file, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith('#') and '=' in line:
+                key, value = line.split('=', 1)
+                tokens[key.strip()] = value.strip()
+    
+    return tokens
+
+
+# Загружаем токены
+try:
+    tokens = load_tokens()
+    DEEPSEEK_API_KEY = tokens.get('DEEPSEEK_API_KEY')
+    TELEGRAM_BOT_TOKEN = tokens.get('TELEGRAM_BOT_TOKEN')
+    
+    if not DEEPSEEK_API_KEY:
+        raise ValueError("DEEPSEEK_API_KEY не найден в tokens.txt")
+    if not TELEGRAM_BOT_TOKEN:
+        raise ValueError("TELEGRAM_BOT_TOKEN не найден в tokens.txt")
+except (FileNotFoundError, ValueError) as e:
+    logger.error(str(e))
+    raise
+
 # Конфигурация
-DEEPSEEK_API_KEY = "sk-ca44e59da3804de68a0435bb15e57631"
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
-TELEGRAM_BOT_TOKEN = "8247068849:AAE9AohmZc2IYEO00Lmn-61v7gUUf-j56Wo"
 
 # Создаем клиент DeepSeek
 deepseek_client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
@@ -141,20 +182,6 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     """Основная функция для запуска бота"""
-    if TELEGRAM_BOT_TOKEN == 'YOUR_TELEGRAM_BOT_TOKEN_HERE':
-        logger.error("Пожалуйста, установите переменную окружения TELEGRAM_BOT_TOKEN или измените значение в коде")
-        print("\n" + "="*60)
-        print("ОШИБКА: Не указан токен Telegram бота!")
-        print("="*60)
-        print("\nЧтобы получить токен:")
-        print("1. Найдите @BotFather в Telegram")
-        print("2. Отправьте команду /newbot")
-        print("3. Следуйте инструкциям")
-        print("\nЗатем установите токен одним из способов:")
-        print("  - Экспорт переменной: export TELEGRAM_BOT_TOKEN='ваш_токен'")
-        print("  - Или измените значение TELEGRAM_BOT_TOKEN в файле bot.py")
-        print("="*60 + "\n")
-        return
     
     # Создаем приложение
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
