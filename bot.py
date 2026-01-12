@@ -68,6 +68,9 @@ deepseek_client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
 # Хранилище истории диалогов для каждого пользователя
 user_conversations = {}
 
+# Хранилище ID сообщений бота для каждого пользователя (для возможности удаления)
+user_bot_messages = {}
+
 
 def get_deepseek_response(user_id: int, user_message: str, system_message: str = "You are a helpful assistant."):
     """
@@ -118,19 +121,27 @@ def get_deepseek_response(user_id: int, user_message: str, system_message: str =
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /start"""
+    user_id = update.effective_user.id
     welcome_message = (
         "👋 Привет! Я бот, использующий DeepSeek API для ответов.\n\n"
         "Просто отправь мне сообщение, и я отвечу!\n\n"
         "Доступные команды:\n"
         "/start - показать это сообщение\n"
         "/clear - очистить историю диалога\n"
+        "/delete_all - удалить все мои сообщения\n"
         "/help - показать справку"
     )
-    await update.message.reply_text(welcome_message)
+    sent_message = await update.message.reply_text(welcome_message)
+    
+    # Сохраняем ID сообщения бота
+    if user_id not in user_bot_messages:
+        user_bot_messages[user_id] = []
+    user_bot_messages[user_id].append(sent_message.message_id)
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /help"""
+    user_id = update.effective_user.id
     help_message = (
         "📖 Справка по боту:\n\n"
         "Я использую DeepSeek AI для ответов на ваши вопросы.\n"
@@ -138,9 +149,15 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Команды:\n"
         "/start - начать работу с ботом\n"
         "/clear - очистить историю нашего диалога\n"
+        "/delete_all - удалить все мои сообщения из чата\n"
         "/help - показать эту справку"
     )
-    await update.message.reply_text(help_message)
+    sent_message = await update.message.reply_text(help_message)
+    
+    # Сохраняем ID сообщения бота
+    if user_id not in user_bot_messages:
+        user_bot_messages[user_id] = []
+    user_bot_messages[user_id].append(sent_message.message_id)
 
 
 async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -148,9 +165,48 @@ async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id in user_conversations:
         del user_conversations[user_id]
-        await update.message.reply_text("✅ История диалога очищена!")
+        sent_message = await update.message.reply_text("✅ История диалога очищена!")
     else:
-        await update.message.reply_text("История диалога уже пуста.")
+        sent_message = await update.message.reply_text("История диалога уже пуста.")
+    
+    # Сохраняем ID сообщения бота
+    if user_id not in user_bot_messages:
+        user_bot_messages[user_id] = []
+    user_bot_messages[user_id].append(sent_message.message_id)
+
+
+async def delete_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /delete_all - удаляет все сообщения бота"""
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    
+    if user_id not in user_bot_messages or not user_bot_messages[user_id]:
+        await update.message.reply_text("Нет сообщений для удаления.")
+        return
+    
+    deleted_count = 0
+    failed_count = 0
+    
+    # Удаляем все сохраненные сообщения бота
+    for message_id in user_bot_messages[user_id]:
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+            deleted_count += 1
+        except Exception as e:
+            logger.warning(f"Не удалось удалить сообщение {message_id}: {str(e)}")
+            failed_count += 1
+    
+    # Очищаем список сообщений
+    user_bot_messages[user_id] = []
+    
+    # Отправляем сообщение о результате (которое тоже будет сохранено)
+    result_message = await update.message.reply_text(
+        f"✅ Удалено сообщений: {deleted_count}"
+        + (f"\n⚠️ Не удалось удалить: {failed_count}" if failed_count > 0 else "")
+    )
+    
+    # Сохраняем ID этого сообщения
+    user_bot_messages[user_id].append(result_message.message_id)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -167,7 +223,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     response = get_deepseek_response(user_id, user_message)
     
     # Отправляем ответ пользователю
-    await update.message.reply_text(response)
+    sent_message = await update.message.reply_text(response)
+    
+    # Сохраняем ID сообщения бота
+    if user_id not in user_bot_messages:
+        user_bot_messages[user_id] = []
+    user_bot_messages[user_id].append(sent_message.message_id)
 
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -190,6 +251,7 @@ def main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("clear", clear_history))
+    application.add_handler(CommandHandler("delete_all", delete_all_messages))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
     # Регистрируем обработчик ошибок
