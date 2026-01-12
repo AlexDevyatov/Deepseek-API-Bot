@@ -82,14 +82,9 @@ python deepseek_client.py
 .
 ├── bot.py                 # Telegram бот
 ├── deepseek_client.py     # CLI клиент для DeepSeek API
-├── tokens.txt            # Файл с токенами (не в git)
 ├── .gitignore            # Игнорируемые файлы
 └── README.md             # Документация
 ```
-
-## Безопасность
-
-⚠️ **Важно:** Файл `tokens.txt` содержит секретные данные и не должен попадать в репозиторий. Он уже добавлен в `.gitignore`.
 
 ## Зависимости
 
