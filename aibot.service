@@ -1,0 +1,19 @@
+[Unit]
+Description=AIAdvent Telegram Bot
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+WorkingDirectory=/opt/aibot
+Environment="PATH=/opt/aibot/.venv/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStart=/opt/aibot/.venv/bin/python3 /opt/aibot/bot.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=aibot
+
+[Install]
+WantedBy=multi-user.target
+
