@@ -1,5 +1,6 @@
 # Токены и секретные данные
 tokens.txt
+requirements.txt
 
 # Python
 __pycache__/
