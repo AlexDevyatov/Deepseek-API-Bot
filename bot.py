@@ -5,8 +5,11 @@
 
 import os
 import logging
-from openai import OpenAI
+import traceback
+import time
+from openai import OpenAI, APIError, APIConnectionError, APITimeoutError, RateLimitError
 from telegram import Update
+from telegram.error import TelegramError, NetworkError, TimedOut
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 # Настройка логирования
@@ -72,7 +75,7 @@ user_conversations = {}
 user_bot_messages = {}
 
 
-def get_deepseek_response(user_id: int, user_message: str, system_message: str = "You are a helpful assistant."):
+def get_deepseek_response(user_id: int, user_message: str, system_message: str = "You are a helpful assistant.", max_retries: int = 3):
     """
     Отправляет сообщение в DeepSeek API и возвращает ответ
     Поддерживает историю диалога для каждого пользователя
@@ -81,42 +84,107 @@ def get_deepseek_response(user_id: int, user_message: str, system_message: str =
         user_id: ID пользователя Telegram
         user_message: Сообщение пользователя
         system_message: Системное сообщение
+        max_retries: Максимальное количество попыток при временных ошибках
     
     Returns:
-        Ответ от API
+        Ответ от API или сообщение об ошибке
     """
-    try:
-        # Получаем историю диалога для пользователя
-        if user_id not in user_conversations:
-            user_conversations[user_id] = [
-                {"role": "system", "content": system_message}
-            ]
-        
-        # Добавляем сообщение пользователя в историю
-        user_conversations[user_id].append({"role": "user", "content": user_message})
-        
-        # Отправляем запрос с историей
-        response = deepseek_client.chat.completions.create(
-            model="deepseek-chat",
-            messages=user_conversations[user_id],
-            stream=False
-        )
-        
-        assistant_message = response.choices[0].message.content
-        
-        # Добавляем ответ ассистента в историю
-        user_conversations[user_id].append({"role": "assistant", "content": assistant_message})
-        
-        # Ограничиваем историю последними 20 сообщениями (чтобы не превышать лимиты токенов)
-        if len(user_conversations[user_id]) > 20:
-            # Оставляем системное сообщение и последние 19 сообщений
-            user_conversations[user_id] = [user_conversations[user_id][0]] + user_conversations[user_id][-19:]
-        
-        return assistant_message
+    # Получаем историю диалога для пользователя
+    if user_id not in user_conversations:
+        user_conversations[user_id] = [
+            {"role": "system", "content": system_message}
+        ]
     
-    except Exception as e:
-        logger.error(f"Ошибка при обращении к DeepSeek API: {str(e)}")
-        return f"Извините, произошла ошибка при обработке запроса: {str(e)}"
+    # Добавляем сообщение пользователя в историю
+    user_conversations[user_id].append({"role": "user", "content": user_message})
+    
+    for attempt in range(max_retries):
+        try:
+            # Отправляем запрос с историей
+            response = deepseek_client.chat.completions.create(
+                model="deepseek-chat",
+                messages=user_conversations[user_id],
+                stream=False,
+                timeout=30.0  # Таймаут 30 секунд
+            )
+            
+            assistant_message = response.choices[0].message.content
+            
+            # Добавляем ответ ассистента в историю
+            user_conversations[user_id].append({"role": "assistant", "content": assistant_message})
+            
+            # Ограничиваем историю последними 20 сообщениями (чтобы не превышать лимиты токенов)
+            if len(user_conversations[user_id]) > 20:
+                # Оставляем системное сообщение и последние 19 сообщений
+                user_conversations[user_id] = [user_conversations[user_id][0]] + user_conversations[user_id][-19:]
+            
+            return assistant_message
+        
+        except RateLimitError as e:
+            logger.warning(f"Rate limit ошибка (попытка {attempt + 1}/{max_retries}): {str(e)}")
+            if attempt < max_retries - 1:
+                wait_time = (attempt + 1) * 2  # Экспоненциальная задержка
+                logger.info(f"Ожидание {wait_time} секунд перед повтором...")
+                time.sleep(wait_time)
+                continue
+            else:
+                logger.error(f"Превышен лимит запросов после {max_retries} попыток")
+                # Удаляем последнее сообщение пользователя из истории, так как оно не было обработано
+                if user_conversations[user_id] and user_conversations[user_id][-1]["role"] == "user":
+                    user_conversations[user_id].pop()
+                return "⚠️ Превышен лимит запросов к API. Пожалуйста, подождите немного и попробуйте снова."
+        
+        except APITimeoutError as e:
+            logger.warning(f"Таймаут API (попытка {attempt + 1}/{max_retries}): {str(e)}")
+            if attempt < max_retries - 1:
+                wait_time = (attempt + 1) * 2
+                logger.info(f"Ожидание {wait_time} секунд перед повтором...")
+                time.sleep(wait_time)
+                continue
+            else:
+                logger.error(f"Таймаут после {max_retries} попыток")
+                if user_conversations[user_id] and user_conversations[user_id][-1]["role"] == "user":
+                    user_conversations[user_id].pop()
+                return "⏱️ Превышено время ожидания ответа от API. Пожалуйста, попробуйте еще раз."
+        
+        except APIConnectionError as e:
+            logger.warning(f"Ошибка подключения к API (попытка {attempt + 1}/{max_retries}): {str(e)}")
+            if attempt < max_retries - 1:
+                wait_time = (attempt + 1) * 2
+                logger.info(f"Ожидание {wait_time} секунд перед повтором...")
+                time.sleep(wait_time)
+                continue
+            else:
+                logger.error(f"Ошибка подключения после {max_retries} попыток")
+                if user_conversations[user_id] and user_conversations[user_id][-1]["role"] == "user":
+                    user_conversations[user_id].pop()
+                return "🔌 Ошибка подключения к API. Проверьте интернет-соединение и попробуйте снова."
+        
+        except APIError as e:
+            logger.error(f"Ошибка API DeepSeek: {str(e)}")
+            if user_conversations[user_id] and user_conversations[user_id][-1]["role"] == "user":
+                user_conversations[user_id].pop()
+            error_code = getattr(e, 'status_code', None)
+            if error_code == 401:
+                return "🔑 Ошибка аутентификации API. Проверьте правильность API ключа."
+            elif error_code == 429:
+                return "⚠️ Превышен лимит запросов. Пожалуйста, подождите немного."
+            elif error_code == 500:
+                return "🔧 Временная ошибка сервера API. Попробуйте позже."
+            else:
+                return f"❌ Ошибка API (код {error_code}): {str(e)}"
+        
+        except Exception as e:
+            logger.error(f"Неожиданная ошибка при обращении к DeepSeek API: {str(e)}")
+            logger.error(f"Трассировка: {traceback.format_exc()}")
+            if user_conversations[user_id] and user_conversations[user_id][-1]["role"] == "user":
+                user_conversations[user_id].pop()
+            return f"❌ Произошла неожиданная ошибка: {str(e)}"
+    
+    # Если все попытки исчерпаны
+    if user_conversations[user_id] and user_conversations[user_id][-1]["role"] == "user":
+        user_conversations[user_id].pop()
+    return "❌ Не удалось обработать запрос после нескольких попыток. Пожалуйста, попробуйте позже."
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -211,34 +279,114 @@ async def delete_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик текстовых сообщений"""
-    user_id = update.effective_user.id
-    user_message = update.message.text
+    try:
+        user_id = update.effective_user.id
+        user_message = update.message.text
+        
+        logger.info(f"Получено сообщение от пользователя {user_id}: {user_message}")
+        
+        # Отправляем индикатор "печатает..."
+        try:
+            await update.message.reply_chat_action(action="typing")
+        except (TelegramError, NetworkError, TimedOut) as e:
+            logger.warning(f"Не удалось отправить chat_action: {str(e)}")
+            # Продолжаем выполнение, это не критично
+        
+        # Получаем ответ от DeepSeek
+        response = get_deepseek_response(user_id, user_message)
+        
+        # Отправляем ответ пользователю
+        try:
+            sent_message = await update.message.reply_text(response)
+            
+            # Сохраняем ID сообщения бота
+            if user_id not in user_bot_messages:
+                user_bot_messages[user_id] = []
+            user_bot_messages[user_id].append(sent_message.message_id)
+        except (TelegramError, NetworkError, TimedOut) as e:
+            logger.error(f"Не удалось отправить сообщение пользователю {user_id}: {str(e)}")
+            # Пытаемся отправить сообщение об ошибке
+            try:
+                await update.message.reply_text(
+                    "❌ Не удалось отправить ответ. Пожалуйста, попробуйте еще раз."
+                )
+            except Exception:
+                logger.error("Не удалось отправить даже сообщение об ошибке")
     
-    logger.info(f"Получено сообщение от пользователя {user_id}: {user_message}")
-    
-    # Отправляем индикатор "печатает..."
-    await update.message.reply_chat_action(action="typing")
-    
-    # Получаем ответ от DeepSeek
-    response = get_deepseek_response(user_id, user_message)
-    
-    # Отправляем ответ пользователю
-    sent_message = await update.message.reply_text(response)
-    
-    # Сохраняем ID сообщения бота
-    if user_id not in user_bot_messages:
-        user_bot_messages[user_id] = []
-    user_bot_messages[user_id].append(sent_message.message_id)
+    except Exception as e:
+        logger.error(f"Критическая ошибка в handle_message: {str(e)}")
+        logger.error(f"Трассировка: {traceback.format_exc()}")
+        if update and update.message:
+            try:
+                await update.message.reply_text(
+                    "❌ Произошла критическая ошибка при обработке сообщения. Пожалуйста, попробуйте позже."
+                )
+            except Exception:
+                logger.error("Не удалось отправить сообщение об ошибке")
 
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик ошибок"""
-    logger.error(f"Update {update} caused error {context.error}")
+    error = context.error
     
+    # Логируем детали ошибки
+    logger.error("=" * 60)
+    logger.error(f"Ошибка в обработчике: {type(error).__name__}")
+    logger.error(f"Сообщение об ошибке: {str(error)}")
+    logger.error(f"Трассировка: {traceback.format_exc()}")
+    
+    if update:
+        logger.error(f"Update ID: {update.update_id}")
+        if update.effective_user:
+            logger.error(f"User ID: {update.effective_user.id}")
+        if update.effective_chat:
+            logger.error(f"Chat ID: {update.effective_chat.id}")
+        if update.message:
+            logger.error(f"Message text: {update.message.text}")
+    logger.error("=" * 60)
+    
+    # Обработка специфических ошибок Telegram
+    if isinstance(error, TimedOut):
+        logger.warning("Таймаут при работе с Telegram API")
+        if update and update.message:
+            try:
+                await update.message.reply_text(
+                    "⏱️ Превышено время ожидания. Пожалуйста, попробуйте еще раз."
+                )
+            except Exception:
+                logger.error("Не удалось отправить сообщение об ошибке таймаута")
+        return
+    
+    if isinstance(error, NetworkError):
+        logger.warning("Ошибка сети при работе с Telegram API")
+        if update and update.message:
+            try:
+                await update.message.reply_text(
+                    "🔌 Ошибка сети. Пожалуйста, проверьте соединение и попробуйте снова."
+                )
+            except Exception:
+                logger.error("Не удалось отправить сообщение об ошибке сети")
+        return
+    
+    if isinstance(error, TelegramError):
+        logger.error(f"Ошибка Telegram API: {str(error)}")
+        if update and update.message:
+            try:
+                await update.message.reply_text(
+                    "⚠️ Ошибка при работе с Telegram. Пожалуйста, попробуйте позже."
+                )
+            except Exception:
+                logger.error("Не удалось отправить сообщение об ошибке Telegram")
+        return
+    
+    # Общая обработка ошибок
     if update and update.message:
-        await update.message.reply_text(
-            "Извините, произошла ошибка. Попробуйте еще раз."
-        )
+        try:
+            await update.message.reply_text(
+                "❌ Произошла ошибка при обработке запроса. Пожалуйста, попробуйте еще раз."
+            )
+        except Exception:
+            logger.error("Не удалось отправить сообщение об общей ошибке")
 
 
 def main():
