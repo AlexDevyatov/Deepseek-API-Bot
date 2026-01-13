@@ -7,6 +7,9 @@ import os
 import logging
 import traceback
 import time
+import json
+import re
+from typing import Optional
 from openai import OpenAI, APIError, APIConnectionError, APITimeoutError, RateLimitError
 from telegram import Update
 from telegram.error import TelegramError, NetworkError, TimedOut
@@ -75,20 +78,134 @@ user_conversations = {}
 user_bot_messages = {}
 
 
-def get_deepseek_response(user_id: int, user_message: str, system_message: str = "You are a helpful assistant.", max_retries: int = 3):
+def extract_json_from_response(response_text: str) -> Optional[dict]:
     """
-    Отправляет сообщение в DeepSeek API и возвращает ответ
+    Извлекает JSON из ответа, даже если он обернут в markdown
+    
+    Args:
+        response_text: Текст ответа от API
+    
+    Returns:
+        Словарь с данными или None при ошибке парсинга
+    """
+    # Пытаемся найти JSON в markdown блоке кода
+    json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', response_text, re.DOTALL)
+    if json_match:
+        try:
+            return json.loads(json_match.group(1))
+        except json.JSONDecodeError as e:
+            logger.debug(f"Не удалось распарсить JSON из markdown блока: {e}")
+    
+    # Пытаемся найти JSON напрямую (первое вхождение {...})
+    json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+    if json_match:
+        try:
+            return json.loads(json_match.group(0))
+        except json.JSONDecodeError as e:
+            logger.debug(f"Не удалось распарсить найденный JSON: {e}")
+    
+    # Пытаемся распарсить весь ответ как JSON
+    try:
+        return json.loads(response_text.strip())
+    except json.JSONDecodeError as e:
+        logger.debug(f"Не удалось распарсить весь ответ как JSON: {e}")
+        return None
+
+
+def validate_json_response(json_data: dict) -> Optional[dict]:
+    """
+    Валидирует структуру JSON ответа
+    
+    Args:
+        json_data: Словарь с данными JSON
+    
+    Returns:
+        Валидированный словарь или None при ошибке валидации
+    """
+    required_fields = ['title', 'body', 'tags']
+    
+    for field in required_fields:
+        if field not in json_data:
+            logger.warning(f"Отсутствует обязательное поле: {field}")
+            return None
+    
+    if not isinstance(json_data['title'], str):
+        logger.warning("Поле 'title' должно быть строкой")
+        return None
+    
+    if not isinstance(json_data['body'], str):
+        logger.warning("Поле 'body' должно быть строкой")
+        return None
+    
+    if not isinstance(json_data['tags'], list):
+        logger.warning("Поле 'tags' должно быть массивом")
+        return None
+    
+    if not all(isinstance(tag, str) for tag in json_data['tags']):
+        logger.warning("Все элементы 'tags' должны быть строками")
+        return None
+    
+    return json_data
+
+
+def format_response(json_data: dict) -> str:
+    """
+    Форматирует JSON ответ для отправки пользователю
+    
+    Args:
+        json_data: Валидированный словарь с данными
+    
+    Returns:
+        Отформатированная строка для отправки пользователю
+    """
+    title = json_data.get('title', 'Без заголовка')
+    body = json_data.get('body', '')
+    tags = json_data.get('tags', [])
+    
+    formatted = f"📌 {title}\n\n{body}"
+    
+    if tags:
+        tags_str = ', '.join(tags)
+        formatted += f"\n\n🏷️ Теги: {tags_str}"
+    
+    return formatted
+
+
+def get_deepseek_response(user_id: int, user_message: str, system_message: str = None, max_retries: int = 3):
+    """
+    Отправляет сообщение в DeepSeek API и возвращает ответ в формате JSON
     Поддерживает историю диалога для каждого пользователя
     
     Args:
         user_id: ID пользователя Telegram
         user_message: Сообщение пользователя
-        system_message: Системное сообщение
+        system_message: Системное сообщение (если None, используется стандартное)
         max_retries: Максимальное количество попыток при временных ошибках
     
     Returns:
-        Ответ от API или сообщение об ошибке
+        tuple: (json_string, formatted_response) при успехе, где:
+            - json_string: JSON строка с данными ответа
+            - formatted_response: Отформатированный ответ для пользователя
+        str: Сообщение об ошибке при неудаче
     """
+    # Стандартное системное сообщение с инструкцией возвращать JSON
+    if system_message is None:
+        system_message = """Ты помощник, который всегда отвечает строго в формате JSON.
+Структура ответа должна быть следующей:
+{
+    "title": "краткий заголовок ответа",
+    "body": "основной текст ответа",
+    "tags": ["тег1", "тег2", "тег3"]
+}
+
+Важно:
+- Ответ должен быть ВАЛИДНЫМ JSON
+- Не добавляй никакого текста до или после JSON
+- Поле "title" - краткий заголовок (до 100 символов)
+- Поле "body" - развернутый ответ на вопрос пользователя
+- Поле "tags" - массив строк с релевантными тегами (3-7 тегов)
+"""
+    
     # Получаем историю диалога для пользователя
     if user_id not in user_conversations:
         user_conversations[user_id] = [
@@ -110,7 +227,28 @@ def get_deepseek_response(user_id: int, user_message: str, system_message: str =
             
             assistant_message = response.choices[0].message.content
             
-            # Добавляем ответ ассистента в историю
+            # Пытаемся извлечь и валидировать JSON из ответа
+            json_data = extract_json_from_response(assistant_message)
+            
+            if json_data is None:
+                logger.warning(f"Не удалось извлечь JSON из ответа. Ответ: {assistant_message[:200]}...")
+                # Сохраняем оригинальный ответ в историю для контекста
+                user_conversations[user_id].append({"role": "assistant", "content": assistant_message})
+                return "⚠️ Ошибка: ответ от AI не является валидным JSON. Попробуйте переформулировать запрос."
+            
+            # Валидируем структуру JSON
+            validated_data = validate_json_response(json_data)
+            
+            if validated_data is None:
+                logger.warning(f"JSON не прошел валидацию. Данные: {json_data}")
+                # Сохраняем оригинальный ответ в историю для контекста
+                user_conversations[user_id].append({"role": "assistant", "content": assistant_message})
+                return "⚠️ Ошибка: ответ от AI не соответствует требуемой структуре. Попробуйте переформулировать запрос."
+            
+            # Форматируем ответ для пользователя
+            formatted_response = format_response(validated_data)
+            
+            # Сохраняем оригинальный JSON ответ в историю для контекста
             user_conversations[user_id].append({"role": "assistant", "content": assistant_message})
             
             # Ограничиваем историю последними 20 сообщениями (чтобы не превышать лимиты токенов)
@@ -118,7 +256,9 @@ def get_deepseek_response(user_id: int, user_message: str, system_message: str =
                 # Оставляем системное сообщение и последние 19 сообщений
                 user_conversations[user_id] = [user_conversations[user_id][0]] + user_conversations[user_id][-19:]
             
-            return assistant_message
+            # Возвращаем кортеж: (JSON строка, отформатированный ответ)
+            json_string = json.dumps(validated_data, ensure_ascii=False, indent=2)
+            return (json_string, formatted_response)
         
         except RateLimitError as e:
             logger.warning(f"Rate limit ошибка (попытка {attempt + 1}/{max_retries}): {str(e)}")
@@ -297,12 +437,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         # Отправляем ответ пользователю
         try:
-            sent_message = await update.message.reply_text(response)
-            
-            # Сохраняем ID сообщения бота
-            if user_id not in user_bot_messages:
-                user_bot_messages[user_id] = []
-            user_bot_messages[user_id].append(sent_message.message_id)
+            # Проверяем, является ли ответ кортежем (успешный ответ) или строкой (ошибка)
+            if isinstance(response, tuple):
+                json_string, formatted_response = response
+                
+                # Сначала отправляем JSON
+                json_message = await update.message.reply_text(f"```json\n{json_string}\n```", parse_mode='Markdown')
+                
+                # Сохраняем ID сообщения с JSON
+                if user_id not in user_bot_messages:
+                    user_bot_messages[user_id] = []
+                user_bot_messages[user_id].append(json_message.message_id)
+                
+                # Затем отправляем отформатированный ответ
+                formatted_message = await update.message.reply_text(formatted_response)
+                
+                # Сохраняем ID сообщения с отформатированным ответом
+                user_bot_messages[user_id].append(formatted_message.message_id)
+            else:
+                # Это сообщение об ошибке (строка)
+                sent_message = await update.message.reply_text(response)
+                
+                # Сохраняем ID сообщения бота
+                if user_id not in user_bot_messages:
+                    user_bot_messages[user_id] = []
+                user_bot_messages[user_id].append(sent_message.message_id)
         except (TelegramError, NetworkError, TimedOut) as e:
             logger.error(f"Не удалось отправить сообщение пользователю {user_id}: {str(e)}")
             # Пытаемся отправить сообщение об ошибке
