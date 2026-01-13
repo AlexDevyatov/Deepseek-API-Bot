@@ -222,6 +222,7 @@ def get_deepseek_response(user_id: int, user_message: str, system_message: str =
                 model="deepseek-chat",
                 messages=user_conversations[user_id],
                 stream=False,
+                temperature=0,  # Температура 0 для детерминированных ответов
                 timeout=30.0  # Таймаут 30 секунд
             )
             
