@@ -163,17 +163,99 @@ sudo systemctl disable aibot
 
 ## Обновление бота
 
-Когда нужно обновить код бота:
+Когда нужно обновить код бота, есть несколько способов:
+
+### Способ 1: Обновление через Git (рекомендуется)
+
+Если проект был развернут через Git:
+
+```bash
+# Подключитесь к серверу
+ssh root@your_server_ip
+
+# Перейдите в директорию проекта
+cd /opt/aibot
+
+# Остановите бота
+sudo systemctl stop aibot
+
+# Обновите код из репозитория
+git pull origin main
+# или если используете другую ветку:
+# git pull origin your_branch_name
+
+# Скопируйте обновленные файлы в рабочую директорию (если нужно)
+# Обычно файлы уже в правильном месте, но если структура отличается:
+sudo cp bot.py deepseek_client.py requirements.txt /opt/aibot/
+
+# Если изменились зависимости, обновите их
+sudo -u www-data /opt/aibot/.venv/bin/pip install -r /opt/aibot/requirements.txt --quiet
+
+# Перезапустите бота
+sudo systemctl start aibot
+
+# Проверьте статус
+sudo systemctl status aibot
+
+# Просмотрите логи для проверки
+sudo journalctl -u aibot -f
+```
+
+### Способ 2: Обновление через SCP (с локального компьютера)
+
+Если проект не в Git или нужно обновить вручную:
+
+```bash
+# На вашем локальном компьютере:
+
+# 1. Остановите бота на сервере
+ssh root@your_server_ip "sudo systemctl stop aibot"
+
+# 2. Загрузите обновленные файлы
+scp bot.py deepseek_client.py requirements.txt root@your_server_ip:/opt/aibot/
+
+# 3. Если изменились зависимости, обновите их на сервере
+ssh root@your_server_ip "sudo -u www-data /opt/aibot/.venv/bin/pip install -r /opt/aibot/requirements.txt --quiet"
+
+# 4. Перезапустите бота
+ssh root@your_server_ip "sudo systemctl start aibot"
+
+# 5. Проверьте статус
+ssh root@your_server_ip "sudo systemctl status aibot"
+```
+
+### Способ 3: Обновление вручную на сервере
+
+Если вы уже подключены к серверу:
 
 ```bash
 # Остановите бота
 sudo systemctl stop aibot
 
 # Обновите файлы (скопируйте новые версии bot.py и других файлов)
-sudo cp bot.py /opt/aibot/
+sudo cp /path/to/updated/bot.py /opt/aibot/
+sudo cp /path/to/updated/deepseek_client.py /opt/aibot/  # если изменился
+sudo cp /path/to/updated/requirements.txt /opt/aibot/   # если изменился
+
+# Если изменились зависимости, обновите их
+sudo -u www-data /opt/aibot/.venv/bin/pip install -r /opt/aibot/requirements.txt --quiet
 
 # Перезапустите бота
 sudo systemctl start aibot
+
+# Проверьте статус и логи
+sudo systemctl status aibot
+sudo journalctl -u aibot -n 50
+```
+
+### Быстрая команда для обновления одного файла
+
+Если изменился только `bot.py`:
+
+```bash
+# На локальном компьютере:
+scp bot.py root@your_server_ip:/tmp/ && \
+ssh root@your_server_ip "sudo systemctl stop aibot && sudo cp /tmp/bot.py /opt/aibot/ && sudo systemctl start aibot && sudo systemctl status aibot"
 ```
 
 ## Устранение неполадок
