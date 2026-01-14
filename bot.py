@@ -68,6 +68,43 @@ except (FileNotFoundError, ValueError) as e:
 # Конфигурация
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 
+# Системное сообщение по умолчанию для модели
+DEFAULT_SYSTEM_MESSAGE = """Ты помощник, который собирает информацию в процессе диалога и выдает финальный результат.
+
+ТВОЯ ЗАДАЧА:
+1. В процессе общения с пользователем собирай информацию и требования
+2. Задавай уточняющие вопросы, если информации недостаточно
+3. Когда у тебя будет достаточно информации для формирования финального результата - САМОСТОЯТЕЛЬНО выдай финальный результат
+4. Финальный результат должен быть полным и структурированным (например, ТЗ, план проекта, анализ и т.д.)
+
+ФОРМАТ ОТВЕТА (всегда строго JSON):
+{
+    "is_final": true или false,
+    "title": "краткий заголовок ответа",
+    "body": "основной текст ответа",
+    "tags": ["тег1", "тег2", "тег3"]
+}
+
+ПРАВИЛА:
+- "is_final": 
+  * false - если это промежуточный ответ, уточняющий вопрос или сбор информации
+  * true - если это ФИНАЛЬНЫЙ результат (например, готовое ТЗ, план, анализ)
+  * ТЫ САМ определяешь, когда достаточно информации для финального результата
+  * Когда выдаешь финальный результат (is_final: true), в "body" помести ПОЛНЫЙ структурированный результат
+
+- "title": краткий заголовок (до 100 символов)
+- "body": 
+  * Если is_final=false: ответ на вопрос, уточнение или запрос дополнительной информации
+  * Если is_final=true: ПОЛНЫЙ финальный результат (например, готовое ТЗ со всеми разделами)
+- "tags": массив строк с релевантными тегами (3-7 тегов)
+
+ВАЖНО:
+- Ответ должен быть ВАЛИДНЫМ JSON
+- Не добавляй никакого текста до или после JSON
+- САМОСТОЯТЕЛЬНО определяй момент, когда можно выдать финальный результат
+- Финальный результат должен быть полным и готовым к использованию
+"""
+
 # Создаем клиент DeepSeek
 deepseek_client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
 
@@ -122,12 +159,16 @@ def validate_json_response(json_data: dict) -> Optional[dict]:
     Returns:
         Валидированный словарь или None при ошибке валидации
     """
-    required_fields = ['title', 'body', 'tags']
+    required_fields = ['is_final', 'title', 'body', 'tags']
     
     for field in required_fields:
         if field not in json_data:
             logger.warning(f"Отсутствует обязательное поле: {field}")
             return None
+    
+    if not isinstance(json_data['is_final'], bool):
+        logger.warning("Поле 'is_final' должно быть булевым значением")
+        return None
     
     if not isinstance(json_data['title'], str):
         logger.warning("Поле 'title' должно быть строкой")
@@ -158,11 +199,16 @@ def format_response(json_data: dict) -> str:
     Returns:
         Отформатированная строка для отправки пользователю
     """
+    is_final = json_data.get('is_final', False)
     title = json_data.get('title', 'Без заголовка')
     body = json_data.get('body', '')
     tags = json_data.get('tags', [])
     
-    formatted = f"📌 {title}\n\n{body}"
+    # Если это финальный результат, добавляем специальную пометку
+    if is_final:
+        formatted = f"✅ ФИНАЛЬНЫЙ РЕЗУЛЬТАТ\n\n📌 {title}\n\n{body}"
+    else:
+        formatted = f"📌 {title}\n\n{body}"
     
     if tags:
         tags_str = ', '.join(tags)
@@ -183,28 +229,15 @@ def get_deepseek_response(user_id: int, user_message: str, system_message: str =
         max_retries: Максимальное количество попыток при временных ошибках
     
     Returns:
-        tuple: (json_string, formatted_response) при успехе, где:
+        tuple: (json_string, formatted_response, is_final) при успехе, где:
             - json_string: JSON строка с данными ответа
             - formatted_response: Отформатированный ответ для пользователя
+            - is_final: Булево значение, указывающее является ли ответ финальным результатом
         str: Сообщение об ошибке при неудаче
     """
-    # Стандартное системное сообщение с инструкцией возвращать JSON
+    # Используем стандартное системное сообщение, если не указано другое
     if system_message is None:
-        system_message = """Ты помощник, который всегда отвечает строго в формате JSON.
-Структура ответа должна быть следующей:
-{
-    "title": "краткий заголовок ответа",
-    "body": "основной текст ответа",
-    "tags": ["тег1", "тег2", "тег3"]
-}
-
-Важно:
-- Ответ должен быть ВАЛИДНЫМ JSON
-- Не добавляй никакого текста до или после JSON
-- Поле "title" - краткий заголовок (до 100 символов)
-- Поле "body" - развернутый ответ на вопрос пользователя
-- Поле "tags" - массив строк с релевантными тегами (3-7 тегов)
-"""
+        system_message = DEFAULT_SYSTEM_MESSAGE
     
     # Получаем историю диалога для пользователя
     if user_id not in user_conversations:
@@ -222,7 +255,7 @@ def get_deepseek_response(user_id: int, user_message: str, system_message: str =
                 model="deepseek-chat",
                 messages=user_conversations[user_id],
                 stream=False,
-                temperature=0,  # Температура 0 для детерминированных ответов
+                temperature=0.1,  # Температура 0.1 для детерминированных ответов
                 timeout=30.0  # Таймаут 30 секунд
             )
             
@@ -249,6 +282,10 @@ def get_deepseek_response(user_id: int, user_message: str, system_message: str =
             # Форматируем ответ для пользователя
             formatted_response = format_response(validated_data)
             
+            # Логируем финальный результат
+            if validated_data.get('is_final', False):
+                logger.info(f"Пользователь {user_id} получил финальный результат: {validated_data.get('title', 'Без заголовка')}")
+            
             # Сохраняем оригинальный JSON ответ в историю для контекста
             user_conversations[user_id].append({"role": "assistant", "content": assistant_message})
             
@@ -257,9 +294,9 @@ def get_deepseek_response(user_id: int, user_message: str, system_message: str =
                 # Оставляем системное сообщение и последние 19 сообщений
                 user_conversations[user_id] = [user_conversations[user_id][0]] + user_conversations[user_id][-19:]
             
-            # Возвращаем кортеж: (JSON строка, отформатированный ответ)
+            # Возвращаем кортеж: (JSON строка, отформатированный ответ, is_final)
             json_string = json.dumps(validated_data, ensure_ascii=False, indent=2)
-            return (json_string, formatted_response)
+            return (json_string, formatted_response, validated_data.get('is_final', False))
         
         except RateLimitError as e:
             logger.warning(f"Rate limit ошибка (попытка {attempt + 1}/{max_retries}): {str(e)}")
@@ -440,7 +477,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             # Проверяем, является ли ответ кортежем (успешный ответ) или строкой (ошибка)
             if isinstance(response, tuple):
-                json_string, formatted_response = response
+                # Поддерживаем как старый формат (2 элемента), так и новый (3 элемента)
+                if len(response) == 3:
+                    json_string, formatted_response, is_final = response
+                else:
+                    json_string, formatted_response = response
+                    is_final = False
                 
                 # Сначала отправляем JSON
                 json_message = await update.message.reply_text(f"```json\n{json_string}\n```", parse_mode='Markdown')
@@ -455,6 +497,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 
                 # Сохраняем ID сообщения с отформатированным ответом
                 user_bot_messages[user_id].append(formatted_message.message_id)
+                
+                # Если это финальный результат, можно предложить очистить историю
+                if is_final:
+                    logger.info(f"Финальный результат отправлен пользователю {user_id}")
             else:
                 # Это сообщение об ошибке (строка)
                 sent_message = await update.message.reply_text(response)
