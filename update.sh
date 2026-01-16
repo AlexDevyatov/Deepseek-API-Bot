@@ -230,13 +230,15 @@ if [ -f "/etc/systemd/system/$SERVICE_NAME.service" ]; then
     echo ""
 fi
 
-# Запускаем сервис, если он был запущен до обновления
-if [ "$SERVICE_WAS_RUNNING" = true ]; then
+# Запускаем сервис после успешного обновления
+# Проверяем, существует ли файл сервиса
+if [ -f "/etc/systemd/system/$SERVICE_NAME.service" ]; then
     echo -e "${YELLOW}Запуск сервиса $SERVICE_NAME...${NC}"
     if systemctl start $SERVICE_NAME; then
         echo -e "${GREEN}Сервис запущен${NC}"
     else
         echo -e "${RED}Ошибка при запуске сервиса${NC}"
+        echo -e "${YELLOW}Проверьте логи: sudo journalctl -u $SERVICE_NAME -n 50${NC}"
         exit 1
     fi
     echo ""
@@ -251,6 +253,10 @@ if [ "$SERVICE_WAS_RUNNING" = true ]; then
         echo -e "${YELLOW}Проверьте логи: sudo journalctl -u $SERVICE_NAME -n 50${NC}"
         exit 1
     fi
+    echo ""
+else
+    echo -e "${YELLOW}Файл сервиса /etc/systemd/system/$SERVICE_NAME.service не найден${NC}"
+    echo -e "${YELLOW}Сервис не будет запущен автоматически${NC}"
     echo ""
 fi
 
