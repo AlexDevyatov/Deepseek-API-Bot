@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Телеграм-бот, использующий DeepSeek API для ответов
+Телеграм-бот для эксперимента "День 4. Разные способы рассуждения"
+Сравнивает разные подходы к решению задач с помощью DeepSeek API
 """
 
 import os
@@ -8,8 +9,7 @@ import logging
 import traceback
 import time
 import json
-import re
-from typing import Optional
+from typing import Optional, Dict, List
 from openai import OpenAI, APIError, APIConnectionError, APITimeoutError, RateLimitError
 from telegram import Update
 from telegram.error import TelegramError, NetworkError, TimedOut
@@ -68,531 +68,542 @@ except (FileNotFoundError, ValueError) as e:
 # Конфигурация
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 
-# Системное сообщение по умолчанию для модели
-DEFAULT_SYSTEM_MESSAGE = """Ты помощник, который собирает информацию в процессе диалога и выдает финальный результат.
-
-ТВОЯ ЗАДАЧА:
-1. В процессе общения с пользователем собирай информацию и требования
-2. Задавай уточняющие вопросы, если информации недостаточно
-3. Когда у тебя будет достаточно информации для формирования финального результата - САМОСТОЯТЕЛЬНО выдай финальный результат
-4. Финальный результат должен быть полным и структурированным (например, ТЗ, план проекта, анализ и т.д.)
-
-ФОРМАТ ОТВЕТА (всегда строго JSON):
-{
-    "is_final": true или false,
-    "title": "краткий заголовок ответа",
-    "body": "основной текст ответа",
-    "tags": ["тег1", "тег2", "тег3"]
-}
-
-ПРАВИЛА:
-- "is_final": 
-  * false - если это промежуточный ответ, уточняющий вопрос или сбор информации
-  * true - если это ФИНАЛЬНЫЙ результат (например, готовое ТЗ, план, анализ)
-  * ТЫ САМ определяешь, когда достаточно информации для финального результата
-  * Когда выдаешь финальный результат (is_final: true), в "body" помести ПОЛНЫЙ структурированный результат
-
-- "title": краткий заголовок (до 100 символов)
-- "body": 
-  * Если is_final=false: ответ на вопрос, уточнение или запрос дополнительной информации
-  * Если is_final=true: ПОЛНЫЙ финальный результат (например, готовое ТЗ со всеми разделами)
-- "tags": массив строк с релевантными тегами (3-7 тегов)
-
-ВАЖНО:
-- Ответ должен быть ВАЛИДНЫМ JSON
-- Не добавляй никакого текста до или после JSON
-- САМОСТОЯТЕЛЬНО определяй момент, когда можно выдать финальный результат
-- Финальный результат должен быть полным и готовым к использованию
-"""
-
 # Создаем клиент DeepSeek
 deepseek_client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
 
-# Хранилище истории диалогов для каждого пользователя
-user_conversations = {}
-
-# Хранилище ID сообщений бота для каждого пользователя (для возможности удаления)
-user_bot_messages = {}
+# Хранилище активных экспериментов для каждого пользователя
+user_experiments = {}
 
 
-def extract_json_from_response(response_text: str) -> Optional[dict]:
+def call_deepseek_api(messages: List[Dict], max_retries: int = 3, temperature: float = 0.7) -> Optional[str]:
     """
-    Извлекает JSON из ответа, даже если он обернут в markdown
+    Вызывает DeepSeek API с обработкой ошибок
     
     Args:
-        response_text: Текст ответа от API
+        messages: Список сообщений для API
+        max_retries: Максимальное количество попыток
+        temperature: Температура для генерации
     
     Returns:
-        Словарь с данными или None при ошибке парсинга
+        Ответ от API или None при ошибке
     """
-    # Пытаемся найти JSON в markdown блоке кода
-    json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', response_text, re.DOTALL)
-    if json_match:
-        try:
-            return json.loads(json_match.group(1))
-        except json.JSONDecodeError as e:
-            logger.debug(f"Не удалось распарсить JSON из markdown блока: {e}")
-    
-    # Пытаемся найти JSON напрямую (первое вхождение {...})
-    json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
-    if json_match:
-        try:
-            return json.loads(json_match.group(0))
-        except json.JSONDecodeError as e:
-            logger.debug(f"Не удалось распарсить найденный JSON: {e}")
-    
-    # Пытаемся распарсить весь ответ как JSON
-    try:
-        return json.loads(response_text.strip())
-    except json.JSONDecodeError as e:
-        logger.debug(f"Не удалось распарсить весь ответ как JSON: {e}")
-        return None
-
-
-def validate_json_response(json_data: dict) -> Optional[dict]:
-    """
-    Валидирует структуру JSON ответа
-    
-    Args:
-        json_data: Словарь с данными JSON
-    
-    Returns:
-        Валидированный словарь или None при ошибке валидации
-    """
-    required_fields = ['is_final', 'title', 'body', 'tags']
-    
-    for field in required_fields:
-        if field not in json_data:
-            logger.warning(f"Отсутствует обязательное поле: {field}")
-            return None
-    
-    if not isinstance(json_data['is_final'], bool):
-        logger.warning("Поле 'is_final' должно быть булевым значением")
-        return None
-    
-    if not isinstance(json_data['title'], str):
-        logger.warning("Поле 'title' должно быть строкой")
-        return None
-    
-    if not isinstance(json_data['body'], str):
-        logger.warning("Поле 'body' должно быть строкой")
-        return None
-    
-    if not isinstance(json_data['tags'], list):
-        logger.warning("Поле 'tags' должно быть массивом")
-        return None
-    
-    if not all(isinstance(tag, str) for tag in json_data['tags']):
-        logger.warning("Все элементы 'tags' должны быть строками")
-        return None
-    
-    return json_data
-
-
-def format_response(json_data: dict) -> str:
-    """
-    Форматирует JSON ответ для отправки пользователю
-    
-    Args:
-        json_data: Валидированный словарь с данными
-    
-    Returns:
-        Отформатированная строка для отправки пользователю
-    """
-    is_final = json_data.get('is_final', False)
-    title = json_data.get('title', 'Без заголовка')
-    body = json_data.get('body', '')
-    tags = json_data.get('tags', [])
-    
-    # Если это финальный результат, добавляем специальную пометку
-    if is_final:
-        formatted = f"✅ ФИНАЛЬНЫЙ РЕЗУЛЬТАТ\n\n📌 {title}\n\n{body}"
-    else:
-        formatted = f"📌 {title}\n\n{body}"
-    
-    if tags:
-        tags_str = ', '.join(tags)
-        formatted += f"\n\n🏷️ Теги: {tags_str}"
-    
-    return formatted
-
-
-def get_deepseek_response(user_id: int, user_message: str, system_message: str = None, max_retries: int = 3):
-    """
-    Отправляет сообщение в DeepSeek API и возвращает ответ в формате JSON
-    Поддерживает историю диалога для каждого пользователя
-    
-    Args:
-        user_id: ID пользователя Telegram
-        user_message: Сообщение пользователя
-        system_message: Системное сообщение (если None, используется стандартное)
-        max_retries: Максимальное количество попыток при временных ошибках
-    
-    Returns:
-        tuple: (json_string, formatted_response, is_final) при успехе, где:
-            - json_string: JSON строка с данными ответа
-            - formatted_response: Отформатированный ответ для пользователя
-            - is_final: Булево значение, указывающее является ли ответ финальным результатом
-        str: Сообщение об ошибке при неудаче
-    """
-    # Используем стандартное системное сообщение, если не указано другое
-    if system_message is None:
-        system_message = DEFAULT_SYSTEM_MESSAGE
-    
-    # Получаем историю диалога для пользователя
-    if user_id not in user_conversations:
-        user_conversations[user_id] = [
-            {"role": "system", "content": system_message}
-        ]
-    
-    # Добавляем сообщение пользователя в историю
-    user_conversations[user_id].append({"role": "user", "content": user_message})
-    
     for attempt in range(max_retries):
         try:
-            # Отправляем запрос с историей
             response = deepseek_client.chat.completions.create(
                 model="deepseek-chat",
-                messages=user_conversations[user_id],
+                messages=messages,
                 stream=False,
-                temperature=0.1,  # Температура 0.1 для детерминированных ответов
-                timeout=30.0  # Таймаут 30 секунд
+                temperature=temperature,
+                timeout=60.0
             )
-            
-            assistant_message = response.choices[0].message.content
-            
-            # Пытаемся извлечь и валидировать JSON из ответа
-            json_data = extract_json_from_response(assistant_message)
-            
-            if json_data is None:
-                logger.warning(f"Не удалось извлечь JSON из ответа. Ответ: {assistant_message[:200]}...")
-                # Сохраняем оригинальный ответ в историю для контекста
-                user_conversations[user_id].append({"role": "assistant", "content": assistant_message})
-                return "⚠️ Ошибка: ответ от AI не является валидным JSON. Попробуйте переформулировать запрос."
-            
-            # Валидируем структуру JSON
-            validated_data = validate_json_response(json_data)
-            
-            if validated_data is None:
-                logger.warning(f"JSON не прошел валидацию. Данные: {json_data}")
-                # Сохраняем оригинальный ответ в историю для контекста
-                user_conversations[user_id].append({"role": "assistant", "content": assistant_message})
-                return "⚠️ Ошибка: ответ от AI не соответствует требуемой структуре. Попробуйте переформулировать запрос."
-            
-            # Форматируем ответ для пользователя
-            formatted_response = format_response(validated_data)
-            
-            # Логируем финальный результат
-            if validated_data.get('is_final', False):
-                logger.info(f"Пользователь {user_id} получил финальный результат: {validated_data.get('title', 'Без заголовка')}")
-            
-            # Сохраняем оригинальный JSON ответ в историю для контекста
-            user_conversations[user_id].append({"role": "assistant", "content": assistant_message})
-            
-            # Ограничиваем историю последними 20 сообщениями (чтобы не превышать лимиты токенов)
-            if len(user_conversations[user_id]) > 20:
-                # Оставляем системное сообщение и последние 19 сообщений
-                user_conversations[user_id] = [user_conversations[user_id][0]] + user_conversations[user_id][-19:]
-            
-            # Возвращаем кортеж: (JSON строка, отформатированный ответ, is_final)
-            json_string = json.dumps(validated_data, ensure_ascii=False, indent=2)
-            return (json_string, formatted_response, validated_data.get('is_final', False))
-        
+            return response.choices[0].message.content
         except RateLimitError as e:
             logger.warning(f"Rate limit ошибка (попытка {attempt + 1}/{max_retries}): {str(e)}")
             if attempt < max_retries - 1:
-                wait_time = (attempt + 1) * 2  # Экспоненциальная задержка
-                logger.info(f"Ожидание {wait_time} секунд перед повтором...")
+                wait_time = (attempt + 1) * 2
                 time.sleep(wait_time)
                 continue
-            else:
-                logger.error(f"Превышен лимит запросов после {max_retries} попыток")
-                # Удаляем последнее сообщение пользователя из истории, так как оно не было обработано
-                if user_conversations[user_id] and user_conversations[user_id][-1]["role"] == "user":
-                    user_conversations[user_id].pop()
-                return "⚠️ Превышен лимит запросов к API. Пожалуйста, подождите немного и попробуйте снова."
-        
-        except APITimeoutError as e:
-            logger.warning(f"Таймаут API (попытка {attempt + 1}/{max_retries}): {str(e)}")
+            return None
+        except (APITimeoutError, APIConnectionError) as e:
+            logger.warning(f"Ошибка подключения (попытка {attempt + 1}/{max_retries}): {str(e)}")
             if attempt < max_retries - 1:
                 wait_time = (attempt + 1) * 2
-                logger.info(f"Ожидание {wait_time} секунд перед повтором...")
                 time.sleep(wait_time)
                 continue
-            else:
-                logger.error(f"Таймаут после {max_retries} попыток")
-                if user_conversations[user_id] and user_conversations[user_id][-1]["role"] == "user":
-                    user_conversations[user_id].pop()
-                return "⏱️ Превышено время ожидания ответа от API. Пожалуйста, попробуйте еще раз."
-        
-        except APIConnectionError as e:
-            logger.warning(f"Ошибка подключения к API (попытка {attempt + 1}/{max_retries}): {str(e)}")
-            if attempt < max_retries - 1:
-                wait_time = (attempt + 1) * 2
-                logger.info(f"Ожидание {wait_time} секунд перед повтором...")
-                time.sleep(wait_time)
-                continue
-            else:
-                logger.error(f"Ошибка подключения после {max_retries} попыток")
-                if user_conversations[user_id] and user_conversations[user_id][-1]["role"] == "user":
-                    user_conversations[user_id].pop()
-                return "🔌 Ошибка подключения к API. Проверьте интернет-соединение и попробуйте снова."
-        
+            return None
         except APIError as e:
-            logger.error(f"Ошибка API DeepSeek: {str(e)}")
-            if user_conversations[user_id] and user_conversations[user_id][-1]["role"] == "user":
-                user_conversations[user_id].pop()
-            error_code = getattr(e, 'status_code', None)
-            if error_code == 401:
-                return "🔑 Ошибка аутентификации API. Проверьте правильность API ключа."
-            elif error_code == 429:
-                return "⚠️ Превышен лимит запросов. Пожалуйста, подождите немного."
-            elif error_code == 500:
-                return "🔧 Временная ошибка сервера API. Попробуйте позже."
-            else:
-                return f"❌ Ошибка API (код {error_code}): {str(e)}"
-        
+            logger.error(f"Ошибка API: {str(e)}")
+            return None
         except Exception as e:
-            logger.error(f"Неожиданная ошибка при обращении к DeepSeek API: {str(e)}")
+            logger.error(f"Неожиданная ошибка: {str(e)}")
             logger.error(f"Трассировка: {traceback.format_exc()}")
-            if user_conversations[user_id] and user_conversations[user_id][-1]["role"] == "user":
-                user_conversations[user_id].pop()
-            return f"❌ Произошла неожиданная ошибка: {str(e)}"
+            return None
     
-    # Если все попытки исчерпаны
-    if user_conversations[user_id] and user_conversations[user_id][-1]["role"] == "user":
-        user_conversations[user_id].pop()
-    return "❌ Не удалось обработать запрос после нескольких попыток. Пожалуйста, попробуйте позже."
+    return None
+
+
+def method1_direct_answer(task: str) -> Dict[str, str]:
+    """
+    Метод 1: Прямой ответ модели
+    
+    Args:
+        task: Текст задачи
+    
+    Returns:
+        Словарь с результатом метода
+    """
+    messages = [
+        {
+            "role": "system",
+            "content": "Ты опытный решатель задач. Дай прямой и четкий ответ на задачу."
+        },
+        {
+            "role": "user",
+            "content": f"Реши следующую задачу:\n\n{task}"
+        }
+    ]
+    
+    response = call_deepseek_api(messages, temperature=0.7)
+    
+    return {
+        "method": "Прямой ответ",
+        "description": "Модель дает ответ напрямую без дополнительных инструкций",
+        "response": response or "Ошибка при получении ответа"
+    }
+
+
+def method2_step_by_step(task: str) -> Dict[str, str]:
+    """
+    Метод 2: Пошаговое решение
+    
+    Args:
+        task: Текст задачи
+    
+    Returns:
+        Словарь с результатом метода
+    """
+    messages = [
+        {
+            "role": "system",
+            "content": "Ты опытный решатель задач. Решай задачи пошагово, объясняя каждый шаг."
+        },
+        {
+            "role": "user",
+            "content": f"Реши следующую задачу пошагово:\n\n{task}\n\nРешай пошагово."
+        }
+    ]
+    
+    response = call_deepseek_api(messages, temperature=0.7)
+    
+    return {
+        "method": "Пошаговое решение",
+        "description": "Модель решает задачу пошагово с инструкцией 'решай пошагово'",
+        "response": response or "Ошибка при получении ответа"
+    }
+
+
+def method3_ai_prompt(task: str) -> Dict[str, str]:
+    """
+    Метод 3: Промпт от другого ИИ
+    
+    Args:
+        task: Текст задачи
+    
+    Returns:
+        Словарь с результатом метода
+    """
+    # Сначала просим другой ИИ составить промпт
+    prompt_creation_messages = [
+        {
+            "role": "system",
+            "content": "Ты эксперт по созданию эффективных промптов для решения задач. Создай оптимальный промпт для решения задачи."
+        },
+        {
+            "role": "user",
+            "content": f"Создай эффективный промпт для решения следующей задачи:\n\n{task}\n\nПромпт должен быть четким и направлять на правильное решение."
+        }
+    ]
+    
+    prompt_response = call_deepseek_api(prompt_creation_messages, temperature=0.8)
+    
+    if not prompt_response:
+        return {
+            "method": "Промпт от другого ИИ",
+            "description": "Другой ИИ создает промпт для решения задачи",
+            "prompt_created": "Ошибка при создании промпта",
+            "response": "Не удалось создать промпт"
+        }
+    
+    # Теперь используем созданный промпт для решения задачи
+    solution_messages = [
+        {
+            "role": "system",
+            "content": "Ты опытный решатель задач. Следуй инструкциям в промпте."
+        },
+        {
+            "role": "user",
+            "content": f"{prompt_response}\n\nТеперь реши задачу:\n\n{task}"
+        }
+    ]
+    
+    solution_response = call_deepseek_api(solution_messages, temperature=0.7)
+    
+    return {
+        "method": "Промпт от другого ИИ",
+        "description": "Другой ИИ создает промпт для решения задачи",
+        "prompt_created": prompt_response,
+        "response": solution_response or "Ошибка при получении ответа"
+    }
+
+
+def method4_expert_panel(task: str) -> Dict[str, str]:
+    """
+    Метод 4: Группа экспертов
+    
+    Args:
+        task: Текст задачи
+    
+    Returns:
+        Словарь с результатом метода
+    """
+    experts = [
+        {
+            "name": "Логик",
+            "role": "Эксперт по логическому мышлению и дедукции",
+            "approach": "анализирует задачу с точки зрения логики и дедуктивного рассуждения"
+        },
+        {
+            "name": "Математик",
+            "role": "Эксперт по математике и численным методам",
+            "approach": "применяет математические методы и численные вычисления"
+        },
+        {
+            "name": "Аналитик",
+            "role": "Эксперт по анализу и структурированию информации",
+            "approach": "разбивает задачу на части и анализирует каждую деталь"
+        }
+    ]
+    
+    expert_responses = []
+    
+    for expert in experts:
+        messages = [
+            {
+                "role": "system",
+                "content": f"Ты {expert['role']}. Ты {expert['approach']}. Дай свое решение задачи."
+            },
+            {
+                "role": "user",
+                "content": f"Реши следующую задачу как {expert['name']}:\n\n{task}"
+            }
+        ]
+        
+        response = call_deepseek_api(messages, temperature=0.8)
+        expert_responses.append({
+            "expert": expert['name'],
+            "response": response or "Ошибка при получении ответа"
+        })
+    
+    # Теперь просим синтезировать ответы экспертов
+    synthesis_messages = [
+        {
+            "role": "system",
+            "content": "Ты модератор группы экспертов. Проанализируй ответы экспертов и создай финальное решение."
+        },
+        {
+            "role": "user",
+            "content": f"Задача:\n\n{task}\n\nОтветы экспертов:\n\n" + 
+                      "\n\n".join([f"{exp['expert']}:\n{exp['response']}" for exp in expert_responses]) +
+                      "\n\nПроанализируй ответы экспертов и создай финальное решение задачи."
+        }
+    ]
+    
+    final_response = call_deepseek_api(synthesis_messages, temperature=0.7)
+    
+    return {
+        "method": "Группа экспертов",
+        "description": "Группа экспертов решает задачу, затем их ответы синтезируются",
+        "expert_responses": expert_responses,
+        "final_response": final_response or "Ошибка при синтезе ответов"
+    }
+
+
+def compare_results(task: str, results: List[Dict[str, str]]) -> str:
+    """
+    Сравнивает результаты разных методов и определяет лучший
+    
+    Args:
+        task: Текст задачи
+        results: Список результатов методов
+    
+    Returns:
+        Текст сравнения и анализа
+    """
+    # Формируем запрос для сравнения
+    comparison_text = f"Задача:\n\n{task}\n\n"
+    comparison_text += "Решения разными методами:\n\n"
+    
+    for i, result in enumerate(results, 1):
+        comparison_text += f"Метод {i}: {result['method']}\n"
+        if result['method'] == "Промпт от другого ИИ":
+            comparison_text += f"Созданный промпт: {result.get('prompt_created', 'N/A')}\n"
+            comparison_text += f"Ответ: {result['response']}\n\n"
+        elif result['method'] == "Группа экспертов":
+            comparison_text += "Ответы экспертов:\n"
+            for exp in result.get('expert_responses', []):
+                comparison_text += f"- {exp['expert']}: {exp['response'][:200]}...\n"
+            comparison_text += f"Финальный ответ: {result.get('final_response', 'N/A')}\n\n"
+        else:
+            comparison_text += f"Ответ: {result['response']}\n\n"
+    
+    comparison_messages = [
+        {
+            "role": "system",
+            "content": "Ты эксперт по анализу решений задач. Сравни разные подходы и определи, какой метод дал наиболее правильный и полный ответ."
+        },
+        {
+            "role": "user",
+            "content": comparison_text + "\n\nСравни эти решения и ответь:\n"
+                       "1. Какие различия между подходами?\n"
+                       "2. Какой метод дал наиболее правильный ответ?\n"
+                       "3. Какие преимущества и недостатки каждого метода?\n"
+                       "4. Какой метод лучше всего подходит для такого типа задач?"
+        }
+    ]
+    
+    comparison_response = call_deepseek_api(comparison_messages, temperature=0.7)
+    
+    return comparison_response or "Ошибка при сравнении результатов"
+
+
+async def run_experiment(update: Update, context: ContextTypes.DEFAULT_TYPE, task: str):
+    """
+    Запускает эксперимент с разными способами рассуждения
+    
+    Args:
+        update: Объект обновления Telegram
+        context: Контекст бота
+        task: Текст задачи для решения
+    """
+    user_id = update.effective_user.id
+    
+    # Отправляем сообщение о начале эксперимента
+    status_message = await update.message.reply_text(
+        "🔬 Начинаю эксперимент с разными способами рассуждения...\n\n"
+        "Это может занять некоторое время. Пожалуйста, подождите."
+    )
+    
+    results = []
+    
+    try:
+        # Метод 1: Прямой ответ
+        await context.bot.edit_message_text(
+            chat_id=update.effective_chat.id,
+            message_id=status_message.message_id,
+            text="🔬 Эксперимент в процессе...\n\n"
+                 "✅ Метод 1: Прямой ответ - выполнен\n"
+                 "⏳ Метод 2: Пошаговое решение - выполняется...\n"
+                 "⏳ Метод 3: Промпт от другого ИИ - ожидание\n"
+                 "⏳ Метод 4: Группа экспертов - ожидание"
+        )
+        result1 = method1_direct_answer(task)
+        results.append(result1)
+        
+        # Метод 2: Пошаговое решение
+        await context.bot.edit_message_text(
+            chat_id=update.effective_chat.id,
+            message_id=status_message.message_id,
+            text="🔬 Эксперимент в процессе...\n\n"
+                 "✅ Метод 1: Прямой ответ - выполнен\n"
+                 "✅ Метод 2: Пошаговое решение - выполнен\n"
+                 "⏳ Метод 3: Промпт от другого ИИ - выполняется...\n"
+                 "⏳ Метод 4: Группа экспертов - ожидание"
+        )
+        result2 = method2_step_by_step(task)
+        results.append(result2)
+        
+        # Метод 3: Промпт от другого ИИ
+        await context.bot.edit_message_text(
+            chat_id=update.effective_chat.id,
+            message_id=status_message.message_id,
+            text="🔬 Эксперимент в процессе...\n\n"
+                 "✅ Метод 1: Прямой ответ - выполнен\n"
+                 "✅ Метод 2: Пошаговое решение - выполнен\n"
+                 "✅ Метод 3: Промпт от другого ИИ - выполнен\n"
+                 "⏳ Метод 4: Группа экспертов - выполняется..."
+        )
+        result3 = method3_ai_prompt(task)
+        results.append(result3)
+        
+        # Метод 4: Группа экспертов
+        await context.bot.edit_message_text(
+            chat_id=update.effective_chat.id,
+            message_id=status_message.message_id,
+            text="🔬 Эксперимент в процессе...\n\n"
+                 "✅ Метод 1: Прямой ответ - выполнен\n"
+                 "✅ Метод 2: Пошаговое решение - выполнен\n"
+                 "✅ Метод 3: Промпт от другого ИИ - выполнен\n"
+                 "✅ Метод 4: Группа экспертов - выполнен\n\n"
+                 "⏳ Сравнение результатов..."
+        )
+        result4 = method4_expert_panel(task)
+        results.append(result4)
+        
+        # Сравнение результатов
+        comparison = compare_results(task, results)
+        
+        # Формируем финальный отчет
+        report = "=" * 60 + "\n"
+        report += "📊 РЕЗУЛЬТАТЫ ЭКСПЕРИМЕНТА\n"
+        report += "=" * 60 + "\n\n"
+        report += f"📝 Задача:\n{task}\n\n"
+        report += "=" * 60 + "\n\n"
+        
+        for i, result in enumerate(results, 1):
+            report += f"🔹 МЕТОД {i}: {result['method']}\n"
+            report += f"Описание: {result['description']}\n\n"
+            
+            if result['method'] == "Промпт от другого ИИ":
+                report += f"📋 Созданный промпт:\n{result.get('prompt_created', 'N/A')}\n\n"
+                report += f"💡 Ответ:\n{result['response']}\n\n"
+            elif result['method'] == "Группа экспертов":
+                report += "👥 Ответы экспертов:\n"
+                for exp in result.get('expert_responses', []):
+                    report += f"\n• {exp['expert']}:\n{exp['response']}\n"
+                report += f"\n🎯 Финальный синтезированный ответ:\n{result.get('final_response', 'N/A')}\n\n"
+            else:
+                report += f"💡 Ответ:\n{result['response']}\n\n"
+            
+            report += "-" * 60 + "\n\n"
+        
+        report += "=" * 60 + "\n"
+        report += "📈 СРАВНЕНИЕ И АНАЛИЗ\n"
+        report += "=" * 60 + "\n\n"
+        report += comparison
+        
+        # Удаляем статусное сообщение
+        try:
+            await context.bot.delete_message(
+                chat_id=update.effective_chat.id,
+                message_id=status_message.message_id
+            )
+        except:
+            pass
+        
+        # Отправляем отчет частями (Telegram имеет лимит на длину сообщения)
+        max_length = 4000
+        if len(report) <= max_length:
+            await update.message.reply_text(report)
+        else:
+            # Разбиваем на части
+            parts = []
+            current_part = ""
+            for line in report.split('\n'):
+                if len(current_part) + len(line) + 1 > max_length:
+                    parts.append(current_part)
+                    current_part = line + '\n'
+                else:
+                    current_part += line + '\n'
+            if current_part:
+                parts.append(current_part)
+            
+            for part in parts:
+                await update.message.reply_text(part)
+                time.sleep(0.5)  # Небольшая задержка между сообщениями
+        
+    except Exception as e:
+        logger.error(f"Ошибка в эксперименте: {str(e)}")
+        logger.error(f"Трассировка: {traceback.format_exc()}")
+        try:
+            await context.bot.edit_message_text(
+                chat_id=update.effective_chat.id,
+                message_id=status_message.message_id,
+                text=f"❌ Произошла ошибка при выполнении эксперимента: {str(e)}"
+            )
+        except:
+            await update.message.reply_text(f"❌ Произошла ошибка при выполнении эксперимента: {str(e)}")
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /start"""
-    user_id = update.effective_user.id
     welcome_message = (
-        "👋 Привет! Я бот, использующий DeepSeek API для ответов.\n\n"
-        "Просто отправь мне сообщение, и я отвечу!\n\n"
-        "Доступные команды:\n"
+        "👋 Привет! Я бот для эксперимента \"День 4. Разные способы рассуждения\"\n\n"
+        "Я сравниваю разные подходы к решению задач:\n"
+        "1️⃣ Прямой ответ модели\n"
+        "2️⃣ Пошаговое решение (с инструкцией \"решай пошагово\")\n"
+        "3️⃣ Промпт от другого ИИ\n"
+        "4️⃣ Группа экспертов\n\n"
+        "📝 Просто отправь мне задачу (логическую или сложную), и я проведу эксперимент!\n\n"
+        "Команды:\n"
         "/start - показать это сообщение\n"
-        "/clear - очистить историю диалога\n"
-        "/delete_all - удалить все мои сообщения\n"
-        "/help - показать справку"
+        "/help - справка\n"
+        "/example - пример задачи для эксперимента"
     )
-    sent_message = await update.message.reply_text(welcome_message)
-    
-    # Сохраняем ID сообщения бота
-    if user_id not in user_bot_messages:
-        user_bot_messages[user_id] = []
-    user_bot_messages[user_id].append(sent_message.message_id)
+    await update.message.reply_text(welcome_message)
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /help"""
-    user_id = update.effective_user.id
     help_message = (
         "📖 Справка по боту:\n\n"
-        "Я использую DeepSeek AI для ответов на ваши вопросы.\n"
-        "Просто напишите мне любое сообщение, и я постараюсь помочь!\n\n"
+        "Этот бот проводит эксперимент по сравнению разных способов рассуждения ИИ.\n\n"
+        "Как использовать:\n"
+        "1. Отправь боту задачу (логическую или сложную)\n"
+        "2. Бот выполнит 4 разных метода решения:\n"
+        "   • Прямой ответ\n"
+        "   • Пошаговое решение\n"
+        "   • Промпт от другого ИИ\n"
+        "   • Группа экспертов\n"
+        "3. Бот сравнит результаты и покажет анализ\n\n"
         "Команды:\n"
-        "/start - начать работу с ботом\n"
-        "/clear - очистить историю нашего диалога\n"
-        "/delete_all - удалить все мои сообщения из чата\n"
-        "/help - показать эту справку"
+        "/start - начать работу\n"
+        "/help - эта справка\n"
+        "/example - пример задачи"
     )
-    sent_message = await update.message.reply_text(help_message)
-    
-    # Сохраняем ID сообщения бота
-    if user_id not in user_bot_messages:
-        user_bot_messages[user_id] = []
-    user_bot_messages[user_id].append(sent_message.message_id)
+    await update.message.reply_text(help_message)
 
 
-async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /clear - очищает историю диалога"""
-    user_id = update.effective_user.id
-    if user_id in user_conversations:
-        del user_conversations[user_id]
-        sent_message = await update.message.reply_text("✅ История диалога очищена!")
-    else:
-        sent_message = await update.message.reply_text("История диалога уже пуста.")
-    
-    # Сохраняем ID сообщения бота
-    if user_id not in user_bot_messages:
-        user_bot_messages[user_id] = []
-    user_bot_messages[user_id].append(sent_message.message_id)
-
-
-async def delete_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /delete_all - удаляет все сообщения бота"""
-    user_id = update.effective_user.id
-    chat_id = update.effective_chat.id
-    
-    if user_id not in user_bot_messages or not user_bot_messages[user_id]:
-        await update.message.reply_text("Нет сообщений для удаления.")
-        return
-    
-    deleted_count = 0
-    failed_count = 0
-    
-    # Удаляем все сохраненные сообщения бота
-    for message_id in user_bot_messages[user_id]:
-        try:
-            await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
-            deleted_count += 1
-        except Exception as e:
-            logger.warning(f"Не удалось удалить сообщение {message_id}: {str(e)}")
-            failed_count += 1
-    
-    # Очищаем список сообщений
-    user_bot_messages[user_id] = []
-    
-    # Отправляем сообщение о результате (которое тоже будет сохранено)
-    result_message = await update.message.reply_text(
-        f"✅ Удалено сообщений: {deleted_count}"
-        + (f"\n⚠️ Не удалось удалить: {failed_count}" if failed_count > 0 else "")
+async def example_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /example - показывает пример задачи"""
+    example_task = (
+        "Задача: В комнате находятся 3 лампы и 3 выключателя. "
+        "Каждый выключатель управляет одной лампой. "
+        "Ты находишься в другой комнате и можешь только один раз войти в комнату с лампами. "
+        "Как определить, какой выключатель управляет какой лампой?"
     )
     
-    # Сохраняем ID этого сообщения
-    user_bot_messages[user_id].append(result_message.message_id)
+    message = (
+        "📝 Пример задачи для эксперимента:\n\n"
+        f"{example_task}\n\n"
+        "Хочешь запустить эксперимент с этой задачей? Просто отправь её мне!"
+    )
+    await update.message.reply_text(message)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик текстовых сообщений"""
     try:
-        user_id = update.effective_user.id
         user_message = update.message.text
         
-        logger.info(f"Получено сообщение от пользователя {user_id}: {user_message}")
+        if not user_message or len(user_message.strip()) < 10:
+            await update.message.reply_text(
+                "⚠️ Пожалуйста, отправь задачу для решения. "
+                "Задача должна содержать хотя бы несколько слов.\n\n"
+                "Используй /example чтобы увидеть пример задачи."
+            )
+            return
         
-        # Отправляем индикатор "печатает..."
-        try:
-            await update.message.reply_chat_action(action="typing")
-        except (TelegramError, NetworkError, TimedOut) as e:
-            logger.warning(f"Не удалось отправить chat_action: {str(e)}")
-            # Продолжаем выполнение, это не критично
+        # Запускаем эксперимент
+        await run_experiment(update, context, user_message.strip())
         
-        # Получаем ответ от DeepSeek
-        response = get_deepseek_response(user_id, user_message)
-        
-        # Отправляем ответ пользователю
-        try:
-            # Проверяем, является ли ответ кортежем (успешный ответ) или строкой (ошибка)
-            if isinstance(response, tuple):
-                # Поддерживаем как старый формат (2 элемента), так и новый (3 элемента)
-                if len(response) == 3:
-                    json_string, formatted_response, is_final = response
-                else:
-                    json_string, formatted_response = response
-                    is_final = False
-                
-                # Сначала отправляем JSON
-                json_message = await update.message.reply_text(f"```json\n{json_string}\n```", parse_mode='Markdown')
-                
-                # Сохраняем ID сообщения с JSON
-                if user_id not in user_bot_messages:
-                    user_bot_messages[user_id] = []
-                user_bot_messages[user_id].append(json_message.message_id)
-                
-                # Затем отправляем отформатированный ответ
-                formatted_message = await update.message.reply_text(formatted_response)
-                
-                # Сохраняем ID сообщения с отформатированным ответом
-                user_bot_messages[user_id].append(formatted_message.message_id)
-                
-                # Если это финальный результат, можно предложить очистить историю
-                if is_final:
-                    logger.info(f"Финальный результат отправлен пользователю {user_id}")
-            else:
-                # Это сообщение об ошибке (строка)
-                sent_message = await update.message.reply_text(response)
-                
-                # Сохраняем ID сообщения бота
-                if user_id not in user_bot_messages:
-                    user_bot_messages[user_id] = []
-                user_bot_messages[user_id].append(sent_message.message_id)
-        except (TelegramError, NetworkError, TimedOut) as e:
-            logger.error(f"Не удалось отправить сообщение пользователю {user_id}: {str(e)}")
-            # Пытаемся отправить сообщение об ошибке
-            try:
-                await update.message.reply_text(
-                    "❌ Не удалось отправить ответ. Пожалуйста, попробуйте еще раз."
-                )
-            except Exception:
-                logger.error("Не удалось отправить даже сообщение об ошибке")
-    
     except Exception as e:
-        logger.error(f"Критическая ошибка в handle_message: {str(e)}")
+        logger.error(f"Ошибка в handle_message: {str(e)}")
         logger.error(f"Трассировка: {traceback.format_exc()}")
-        if update and update.message:
-            try:
-                await update.message.reply_text(
-                    "❌ Произошла критическая ошибка при обработке сообщения. Пожалуйста, попробуйте позже."
-                )
-            except Exception:
-                logger.error("Не удалось отправить сообщение об ошибке")
+        try:
+            await update.message.reply_text(
+                "❌ Произошла ошибка при обработке сообщения. Пожалуйста, попробуйте позже."
+            )
+        except:
+            pass
 
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик ошибок"""
     error = context.error
     
-    # Логируем детали ошибки
     logger.error("=" * 60)
     logger.error(f"Ошибка в обработчике: {type(error).__name__}")
     logger.error(f"Сообщение об ошибке: {str(error)}")
     logger.error(f"Трассировка: {traceback.format_exc()}")
-    
-    if update:
-        logger.error(f"Update ID: {update.update_id}")
-        if update.effective_user:
-            logger.error(f"User ID: {update.effective_user.id}")
-        if update.effective_chat:
-            logger.error(f"Chat ID: {update.effective_chat.id}")
-        if update.message:
-            logger.error(f"Message text: {update.message.text}")
     logger.error("=" * 60)
     
-    # Обработка специфических ошибок Telegram
-    if isinstance(error, TimedOut):
-        logger.warning("Таймаут при работе с Telegram API")
-        if update and update.message:
-            try:
-                await update.message.reply_text(
-                    "⏱️ Превышено время ожидания. Пожалуйста, попробуйте еще раз."
-                )
-            except Exception:
-                logger.error("Не удалось отправить сообщение об ошибке таймаута")
-        return
-    
-    if isinstance(error, NetworkError):
-        logger.warning("Ошибка сети при работе с Telegram API")
-        if update and update.message:
-            try:
-                await update.message.reply_text(
-                    "🔌 Ошибка сети. Пожалуйста, проверьте соединение и попробуйте снова."
-                )
-            except Exception:
-                logger.error("Не удалось отправить сообщение об ошибке сети")
-        return
-    
-    if isinstance(error, TelegramError):
-        logger.error(f"Ошибка Telegram API: {str(error)}")
-        if update and update.message:
-            try:
-                await update.message.reply_text(
-                    "⚠️ Ошибка при работе с Telegram. Пожалуйста, попробуйте позже."
-                )
-            except Exception:
-                logger.error("Не удалось отправить сообщение об ошибке Telegram")
-        return
-    
-    # Общая обработка ошибок
     if update and update.message:
         try:
             await update.message.reply_text(
                 "❌ Произошла ошибка при обработке запроса. Пожалуйста, попробуйте еще раз."
             )
-        except Exception:
-            logger.error("Не удалось отправить сообщение об общей ошибке")
+        except:
+            pass
 
 
 def main():
@@ -604,8 +615,7 @@ def main():
     # Регистрируем обработчики
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("clear", clear_history))
-    application.add_handler(CommandHandler("delete_all", delete_all_messages))
+    application.add_handler(CommandHandler("example", example_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
     # Регистрируем обработчик ошибок
@@ -614,7 +624,7 @@ def main():
     # Запускаем бота
     logger.info("Бот запущен и готов к работе!")
     print("\n" + "="*60)
-    print("🤖 Телеграм-бот запущен!")
+    print("🤖 Телеграм-бот для эксперимента запущен!")
     print("="*60)
     print("Нажмите Ctrl+C для остановки\n")
     
@@ -623,4 +633,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
