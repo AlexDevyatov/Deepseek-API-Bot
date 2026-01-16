@@ -72,6 +72,13 @@ if [ -d "$APP_DIR/.git" ]; then
     echo -e "${YELLOW}Обновление кода через Git...${NC}"
     cd "$APP_DIR"
     
+    # Исправляем проблему с dubious ownership (если нужно)
+    # Git может жаловаться, если владелец репозитория отличается от текущего пользователя
+    if ! git config --global --get safe.directory | grep -q "^$APP_DIR$" 2>/dev/null; then
+        echo -e "${YELLOW}Добавление директории в safe.directory для Git...${NC}"
+        git config --global --add safe.directory "$APP_DIR" 2>/dev/null || true
+    fi
+    
     # Сохраняем текущую ветку
     CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "main")
     echo -e "${BLUE}Текущая ветка: $CURRENT_BRANCH${NC}"
