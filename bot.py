@@ -9,7 +9,10 @@ import logging
 import traceback
 import time
 import json
-from typing import Optional, Dict, List
+import re
+import requests
+import io
+from typing import Optional, Dict, List, Tuple
 from openai import OpenAI, APIError, APIConnectionError, APITimeoutError, RateLimitError
 from telegram import Update
 from telegram.error import TelegramError, NetworkError, TimedOut
@@ -120,6 +123,201 @@ def call_deepseek_api(messages: List[Dict], max_retries: int = 3, temperature: f
             return None
     
     return None
+
+
+def render_latex_to_image(latex_formula: str) -> Optional[io.BytesIO]:
+    """
+    Конвертирует LaTeX формулу в изображение
+    
+    Args:
+        latex_formula: LaTeX формула (без $ или $$)
+    
+    Returns:
+        BytesIO объект с изображением или None при ошибке
+    """
+    try:
+        # Убираем лишние пробелы и экранируем специальные символы
+        formula = latex_formula.strip()
+        
+        # Используем более надежный API для рендеринга LaTeX
+        # Вариант 1: QuickLaTeX API
+        url = "https://quicklatex.com/latex3.f"
+        
+        data = {
+            'formula': formula,
+            'fsize': '20px',
+            'fcolor': '000000',
+            'mode': '0',
+            'out': '1',
+            'remhost': 'quicklatex.com'
+        }
+        
+        response = requests.post(url, data=data, timeout=15)
+        
+        if response.status_code == 200:
+            lines = response.text.strip().split('\n')
+            if len(lines) >= 2 and lines[0] == '0':  # 0 означает успех
+                image_url = lines[1]
+                img_response = requests.get(image_url, timeout=15)
+                if img_response.status_code == 200:
+                    return io.BytesIO(img_response.content)
+        
+        # Вариант 2: CodeCogs API (лучше для дробей и сложных формул)
+        formula_encoded = requests.utils.quote(formula)
+        # Используем PNG формат для лучшей совместимости с Telegram
+        codecogs_url = f"https://latex.codecogs.com/png.latex?\\dpi{{300}}\\bg{{white}} {formula_encoded}"
+        
+        img_response = requests.get(codecogs_url, timeout=15)
+        if img_response.status_code == 200 and len(img_response.content) > 100:  # Проверяем, что получили изображение
+            return io.BytesIO(img_response.content)
+        
+        # Вариант 3: Простой CodeCogs без параметров
+        simple_url = f"https://latex.codecogs.com/png.latex?{formula_encoded}"
+        simple_response = requests.get(simple_url, timeout=15)
+        if simple_response.status_code == 200 and len(simple_response.content) > 100:
+            return io.BytesIO(simple_response.content)
+        
+        logger.warning(f"Не удалось отрендерить LaTeX формулу: {formula}")
+        return None
+        
+    except Exception as e:
+        logger.error(f"Ошибка при рендеринге LaTeX: {str(e)}")
+        return None
+
+
+def find_latex_formulas(text: str) -> List[Tuple[str, int, int]]:
+    """
+    Находит LaTeX формулы в тексте
+    
+    Args:
+        text: Текст для поиска формул
+    
+    Returns:
+        Список кортежей (formula, start_pos, end_pos) для каждой найденной формулы
+    """
+    formulas = []
+    
+    # Ищем формулы в формате $$...$$ (блочные формулы)
+    pattern_block = r'\$\$([^$]+)\$\$'
+    for match in re.finditer(pattern_block, text, re.DOTALL):
+        formulas.append((match.group(1).strip(), match.start(), match.end()))
+    
+    # Ищем формулы в формате $...$ (инлайн формулы)
+    pattern_inline = r'\$([^$\n]+?)\$'
+    for match in re.finditer(pattern_inline, text):
+        # Проверяем, что это не часть блочной формулы
+        is_part_of_block = False
+        for block_start, block_end in [(m.start(), m.end()) for m in re.finditer(pattern_block, text, re.DOTALL)]:
+            if block_start <= match.start() < block_end:
+                is_part_of_block = True
+                break
+        if not is_part_of_block:
+            formulas.append((match.group(1).strip(), match.start(), match.end()))
+    
+    return formulas
+
+
+async def send_message_with_latex(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+    """
+    Отправляет сообщение с поддержкой LaTeX формул
+    
+    Args:
+        update: Объект обновления Telegram
+        context: Контекст бота
+        text: Текст сообщения с возможными LaTeX формулами
+    """
+    formulas = find_latex_formulas(text)
+    
+    if not formulas:
+        # Нет формул, отправляем обычный текст
+        max_length = 4000
+        if len(text) <= max_length:
+            await update.message.reply_text(text)
+        else:
+            parts = []
+            current_part = ""
+            for line in text.split('\n'):
+                if len(current_part) + len(line) + 1 > max_length:
+                    if current_part:
+                        parts.append(current_part)
+                    current_part = line + '\n'
+                else:
+                    current_part += line + '\n'
+            if current_part:
+                parts.append(current_part)
+            
+            for part in parts:
+                await update.message.reply_text(part)
+                time.sleep(0.3)
+        return
+    
+    # Есть формулы, обрабатываем их
+    last_pos = 0
+    parts = []
+    
+    for formula, start, end in formulas:
+        # Добавляем текст до формулы
+        if start > last_pos:
+            parts.append(('text', text[last_pos:start]))
+        
+        # Рендерим формулу
+        image = render_latex_to_image(formula)
+        if image:
+            parts.append(('image', (image, formula)))
+        else:
+            # Если не удалось отрендерить, оставляем как текст
+            parts.append(('text', text[start:end]))
+        
+        last_pos = end
+    
+    # Добавляем оставшийся текст
+    if last_pos < len(text):
+        parts.append(('text', text[last_pos:]))
+    
+    # Отправляем части
+    current_text = ""
+    for part_type, content in parts:
+        if part_type == 'text':
+            if content.strip():
+                current_text += content
+        elif part_type == 'image':
+            # Отправляем накопленный текст, если есть
+            if current_text.strip():
+                if len(current_text) > 4000:
+                    text_lines = current_text.split('\n')
+                    for line in text_lines:
+                        if len(line) > 4000:
+                            chunks = [line[i:i+4000] for i in range(0, len(line), 4000)]
+                            for chunk in chunks:
+                                await update.message.reply_text(chunk)
+                                time.sleep(0.3)
+                        elif line.strip():
+                            await update.message.reply_text(line)
+                            time.sleep(0.3)
+                else:
+                    await update.message.reply_text(current_text)
+                    time.sleep(0.3)
+                current_text = ""
+            
+            # Отправляем изображение формулы
+            image_io, formula_text = content
+            try:
+                image_io.seek(0)
+                await update.message.reply_photo(photo=image_io)
+            except Exception as e:
+                logger.error(f"Ошибка при отправке изображения LaTeX: {str(e)}")
+                await update.message.reply_text(f"Формула: ${formula_text}$")
+            time.sleep(0.3)
+    
+    # Отправляем оставшийся текст
+    if current_text.strip():
+        if len(current_text) > 4000:
+            chunks = [current_text[i:i+4000] for i in range(0, len(current_text), 4000)]
+            for chunk in chunks:
+                await update.message.reply_text(chunk)
+                time.sleep(0.3)
+        else:
+            await update.message.reply_text(current_text)
 
 
 def method1_direct_answer(task: str) -> Dict[str, str]:
@@ -470,26 +668,8 @@ async def run_experiment(update: Update, context: ContextTypes.DEFAULT_TYPE, tas
         except:
             pass
         
-        # Отправляем отчет частями (Telegram имеет лимит на длину сообщения)
-        max_length = 4000
-        if len(report) <= max_length:
-            await update.message.reply_text(report)
-        else:
-            # Разбиваем на части
-            parts = []
-            current_part = ""
-            for line in report.split('\n'):
-                if len(current_part) + len(line) + 1 > max_length:
-                    parts.append(current_part)
-                    current_part = line + '\n'
-                else:
-                    current_part += line + '\n'
-            if current_part:
-                parts.append(current_part)
-            
-            for part in parts:
-                await update.message.reply_text(part)
-                time.sleep(0.5)  # Небольшая задержка между сообщениями
+        # Отправляем отчет с поддержкой LaTeX
+        await send_message_with_latex(update, context, report)
         
     except Exception as e:
         logger.error(f"Ошибка в эксперименте: {str(e)}")
