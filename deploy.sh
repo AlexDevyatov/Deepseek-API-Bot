@@ -48,57 +48,9 @@ if [ ${#MISSING_FILES[@]} -ne 0 ]; then
     exit 1
 fi
 
-# Создаем директорию приложения
-echo -e "${YELLOW}Создание директории приложения...${NC}"
-if ! mkdir -p $APP_DIR; then
-    echo -e "${RED}Ошибка при создании директории $APP_DIR${NC}"
-    exit 1
-fi
-echo -e "${GREEN}Директория создана: $APP_DIR${NC}"
-
-# Копируем файлы проекта по одному с проверкой
-echo -e "${YELLOW}Копирование файлов проекта...${NC}"
-FILES_TO_COPY=("bot.py" "deepseek_client.py" "requirements.txt")
-FAILED_FILES=()
-
-for file in "${FILES_TO_COPY[@]}"; do
-    SOURCE_FILE="$SCRIPT_DIR/$file"
-    DEST_FILE="$APP_DIR/$file"
-    
-    # Проверяем существование исходного файла
-    if [ ! -f "$SOURCE_FILE" ]; then
-        echo -e "${RED}Ошибка: файл $SOURCE_FILE не найден${NC}"
-        FAILED_FILES+=("$file")
-        continue
-    fi
-    
-    # Копируем файл
-    echo -e "${YELLOW}  Копирование $file...${NC}"
-    if ! cp "$SOURCE_FILE" "$DEST_FILE"; then
-        echo -e "${RED}Ошибка при копировании $file${NC}"
-        FAILED_FILES+=("$file")
-        continue
-    fi
-    
-    # Проверяем, что файл скопирован
-    if [ ! -f "$DEST_FILE" ]; then
-        echo -e "${RED}Ошибка: файл $DEST_FILE не был создан${NC}"
-        FAILED_FILES+=("$file")
-        continue
-    fi
-    
-    echo -e "${GREEN}  ✓ $file скопирован${NC}"
-done
-
-# Проверяем, были ли ошибки
-if [ ${#FAILED_FILES[@]} -ne 0 ]; then
-    echo -e "${RED}Ошибка: не удалось скопировать следующие файлы:${NC}"
-    for file in "${FAILED_FILES[@]}"; do
-        echo -e "${RED}  - $file${NC}"
-    done
-    echo -e "${YELLOW}Проверьте права доступа и существование файлов${NC}"
-    exit 1
-fi
+# Используем директорию проекта как рабочую директорию
+APP_DIR="$SCRIPT_DIR"
+echo -e "${YELLOW}Использование директории проекта: $APP_DIR${NC}"
 
 # Проверяем существование пользователя
 echo -e "${YELLOW}Проверка пользователя $SERVICE_USER...${NC}"
@@ -133,7 +85,7 @@ if ! chown -R $SERVICE_USER:$SERVICE_USER $APP_DIR; then
     ls -la $(dirname $APP_DIR) | grep $(basename $APP_DIR) || echo "Директория не найдена в списке"
     exit 1
 fi
-echo -e "${GREEN}Файлы скопированы и права установлены${NC}"
+echo -e "${GREEN}Права доступа установлены${NC}"
 
 # Проверяем наличие tokens.txt
 if [ ! -f "$APP_DIR/tokens.txt" ]; then
@@ -204,10 +156,18 @@ if [ ! -f "$SCRIPT_DIR/$SERVICE_FILE" ]; then
     exit 1
 fi
 
-if ! cp "$SCRIPT_DIR/$SERVICE_FILE" /etc/systemd/system/; then
+# Создаем временный service файл с правильными путями
+TEMP_SERVICE="/tmp/${SERVICE_FILE}.tmp"
+sed "s|/opt/aibot|$APP_DIR|g" "$SCRIPT_DIR/$SERVICE_FILE" > "$TEMP_SERVICE"
+
+if ! cp "$TEMP_SERVICE" /etc/systemd/system/$SERVICE_FILE; then
     echo -e "${RED}Ошибка при копировании service файла${NC}"
+    rm -f "$TEMP_SERVICE"
     exit 1
 fi
+
+rm -f "$TEMP_SERVICE"
+echo -e "${GREEN}Service файл настроен с путем: $APP_DIR${NC}"
 
 if ! systemctl daemon-reload; then
     echo -e "${RED}Ошибка при перезагрузке systemd${NC}"
