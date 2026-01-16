@@ -50,17 +50,87 @@ fi
 
 # Создаем директорию приложения
 echo -e "${YELLOW}Создание директории приложения...${NC}"
-mkdir -p $APP_DIR
+if ! mkdir -p $APP_DIR; then
+    echo -e "${RED}Ошибка при создании директории $APP_DIR${NC}"
+    exit 1
+fi
+echo -e "${GREEN}Директория создана: $APP_DIR${NC}"
 
-# Копируем файлы проекта
+# Копируем файлы проекта по одному с проверкой
 echo -e "${YELLOW}Копирование файлов проекта...${NC}"
-if ! cp "$SCRIPT_DIR/bot.py" "$SCRIPT_DIR/deepseek_client.py" "$SCRIPT_DIR/requirements.txt" $APP_DIR/; then
-    echo -e "${RED}Ошибка при копировании файлов проекта${NC}"
+FILES_TO_COPY=("bot.py" "deepseek_client.py" "requirements.txt")
+FAILED_FILES=()
+
+for file in "${FILES_TO_COPY[@]}"; do
+    SOURCE_FILE="$SCRIPT_DIR/$file"
+    DEST_FILE="$APP_DIR/$file"
+    
+    # Проверяем существование исходного файла
+    if [ ! -f "$SOURCE_FILE" ]; then
+        echo -e "${RED}Ошибка: файл $SOURCE_FILE не найден${NC}"
+        FAILED_FILES+=("$file")
+        continue
+    fi
+    
+    # Копируем файл
+    echo -e "${YELLOW}  Копирование $file...${NC}"
+    if ! cp "$SOURCE_FILE" "$DEST_FILE"; then
+        echo -e "${RED}Ошибка при копировании $file${NC}"
+        FAILED_FILES+=("$file")
+        continue
+    fi
+    
+    # Проверяем, что файл скопирован
+    if [ ! -f "$DEST_FILE" ]; then
+        echo -e "${RED}Ошибка: файл $DEST_FILE не был создан${NC}"
+        FAILED_FILES+=("$file")
+        continue
+    fi
+    
+    echo -e "${GREEN}  ✓ $file скопирован${NC}"
+done
+
+# Проверяем, были ли ошибки
+if [ ${#FAILED_FILES[@]} -ne 0 ]; then
+    echo -e "${RED}Ошибка: не удалось скопировать следующие файлы:${NC}"
+    for file in "${FAILED_FILES[@]}"; do
+        echo -e "${RED}  - $file${NC}"
+    done
+    echo -e "${YELLOW}Проверьте права доступа и существование файлов${NC}"
     exit 1
 fi
 
+# Проверяем существование пользователя
+echo -e "${YELLOW}Проверка пользователя $SERVICE_USER...${NC}"
+if ! id "$SERVICE_USER" &>/dev/null; then
+    echo -e "${YELLOW}Пользователь $SERVICE_USER не найден, создаем...${NC}"
+    if [ -f /etc/debian_version ]; then
+        # Для Debian/Ubuntu
+        if ! useradd -r -s /bin/false $SERVICE_USER 2>/dev/null; then
+            echo -e "${RED}Не удалось создать пользователя $SERVICE_USER${NC}"
+            echo -e "${YELLOW}Попробуйте создать его вручную или измените SERVICE_USER в скрипте${NC}"
+            exit 1
+        fi
+    elif [ -f /etc/redhat-release ]; then
+        # Для CentOS/RHEL
+        if ! useradd -r -s /sbin/nologin $SERVICE_USER 2>/dev/null; then
+            echo -e "${RED}Не удалось создать пользователя $SERVICE_USER${NC}"
+            exit 1
+        fi
+    else
+        echo -e "${RED}Не удалось определить дистрибутив для создания пользователя${NC}"
+        echo -e "${YELLOW}Создайте пользователя $SERVICE_USER вручную или измените SERVICE_USER в скрипте${NC}"
+        exit 1
+    fi
+    echo -e "${GREEN}Пользователь $SERVICE_USER создан${NC}"
+fi
+
+# Устанавливаем права доступа
+echo -e "${YELLOW}Установка прав доступа...${NC}"
 if ! chown -R $SERVICE_USER:$SERVICE_USER $APP_DIR; then
     echo -e "${RED}Ошибка при изменении владельца файлов${NC}"
+    echo -e "${YELLOW}Проверьте права доступа к директории $APP_DIR${NC}"
+    ls -la $(dirname $APP_DIR) | grep $(basename $APP_DIR) || echo "Директория не найдена в списке"
     exit 1
 fi
 echo -e "${GREEN}Файлы скопированы и права установлены${NC}"
