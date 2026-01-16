@@ -138,50 +138,81 @@ def render_latex_to_image(latex_formula: str) -> Optional[io.BytesIO]:
     try:
         # Убираем лишние пробелы и экранируем специальные символы
         formula = latex_formula.strip()
+        if not formula:
+            logger.warning("Пустая формула")
+            return None
         
-        # Используем более надежный API для рендеринга LaTeX
-        # Вариант 1: QuickLaTeX API
-        url = "https://quicklatex.com/latex3.f"
+        logger.debug(f"Рендеринг LaTeX формулы: {formula[:50]}...")
         
-        data = {
-            'formula': formula,
-            'fsize': '20px',
-            'fcolor': '000000',
-            'mode': '0',
-            'out': '1',
-            'remhost': 'quicklatex.com'
-        }
-        
-        response = requests.post(url, data=data, timeout=15)
-        
-        if response.status_code == 200:
-            lines = response.text.strip().split('\n')
-            if len(lines) >= 2 and lines[0] == '0':  # 0 означает успех
-                image_url = lines[1]
-                img_response = requests.get(image_url, timeout=15)
-                if img_response.status_code == 200:
-                    return io.BytesIO(img_response.content)
-        
-        # Вариант 2: CodeCogs API (лучше для дробей и сложных формул)
+        # Вариант 1: CodeCogs API (самый надежный)
         formula_encoded = requests.utils.quote(formula)
-        # Используем PNG формат для лучшей совместимости с Telegram
-        codecogs_url = f"https://latex.codecogs.com/png.latex?\\dpi{{300}}\\bg{{white}} {formula_encoded}"
         
-        img_response = requests.get(codecogs_url, timeout=15)
-        if img_response.status_code == 200 and len(img_response.content) > 100:  # Проверяем, что получили изображение
-            return io.BytesIO(img_response.content)
+        # Пробуем разные варианты CodeCogs
+        codecogs_urls = [
+            f"https://latex.codecogs.com/svg.latex?{formula_encoded}",  # SVG (лучшее качество)
+            f"https://latex.codecogs.com/png.latex?\\dpi{{300}}\\bg{{white}} {formula_encoded}",  # PNG с параметрами
+            f"https://latex.codecogs.com/png.latex?{formula_encoded}",  # Простой PNG
+        ]
         
-        # Вариант 3: Простой CodeCogs без параметров
-        simple_url = f"https://latex.codecogs.com/png.latex?{formula_encoded}"
-        simple_response = requests.get(simple_url, timeout=15)
-        if simple_response.status_code == 200 and len(simple_response.content) > 100:
-            return io.BytesIO(simple_response.content)
+        for url in codecogs_urls:
+            try:
+                img_response = requests.get(url, timeout=20, headers={
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                })
+                if img_response.status_code == 200:
+                    content = img_response.content
+                    # Проверяем, что получили изображение (не HTML страницу с ошибкой)
+                    if len(content) > 100 and not content.startswith(b'<'):
+                        logger.debug(f"Успешно получено изображение с {url[:50]}...")
+                        return io.BytesIO(content)
+            except Exception as e:
+                logger.debug(f"Ошибка при запросе {url[:50]}...: {str(e)}")
+                continue
         
-        logger.warning(f"Не удалось отрендерить LaTeX формулу: {formula}")
+        # Вариант 2: QuickLaTeX API
+        try:
+            url = "https://quicklatex.com/latex3.f"
+            data = {
+                'formula': formula,
+                'fsize': '20px',
+                'fcolor': '000000',
+                'mode': '0',
+                'out': '1',
+                'remhost': 'quicklatex.com'
+            }
+            
+            response = requests.post(url, data=data, timeout=20, headers={
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            })
+            
+            if response.status_code == 200:
+                lines = response.text.strip().split('\n')
+                if len(lines) >= 2 and lines[0] == '0':  # 0 означает успех
+                    image_url = lines[1]
+                    img_response = requests.get(image_url, timeout=20)
+                    if img_response.status_code == 200 and len(img_response.content) > 100:
+                        logger.debug("Успешно получено изображение с QuickLaTeX")
+                        return io.BytesIO(img_response.content)
+        except Exception as e:
+            logger.debug(f"Ошибка QuickLaTeX: {str(e)}")
+        
+        # Вариант 3: iTeX2MML через MathJax API (если доступен)
+        try:
+            # Используем MathJax Node API через публичный сервис
+            mathjax_url = f"https://api.mathml.cloud/api/v1/formula?formula={formula_encoded}"
+            img_response = requests.get(mathjax_url, timeout=20)
+            if img_response.status_code == 200 and len(img_response.content) > 100:
+                logger.debug("Успешно получено изображение с MathML API")
+                return io.BytesIO(img_response.content)
+        except Exception as e:
+            logger.debug(f"Ошибка MathML API: {str(e)}")
+        
+        logger.warning(f"Не удалось отрендерить LaTeX формулу: {formula[:100]}")
         return None
         
     except Exception as e:
         logger.error(f"Ошибка при рендеринге LaTeX: {str(e)}")
+        logger.error(f"Трассировка: {traceback.format_exc()}")
         return None
 
 
@@ -196,24 +227,45 @@ def find_latex_formulas(text: str) -> List[Tuple[str, int, int]]:
         Список кортежей (formula, start_pos, end_pos) для каждой найденной формулы
     """
     formulas = []
+    used_positions = set()  # Отслеживаем уже использованные позиции
     
     # Ищем формулы в формате $$...$$ (блочные формулы)
-    pattern_block = r'\$\$([^$]+)\$\$'
-    for match in re.finditer(pattern_block, text, re.DOTALL):
-        formulas.append((match.group(1).strip(), match.start(), match.end()))
+    pattern_block_dollar = r'\$\$([^$]+)\$\$'
+    for match in re.finditer(pattern_block_dollar, text, re.DOTALL):
+        start, end = match.start(), match.end()
+        if start not in used_positions:
+            formulas.append((match.group(1).strip(), start, end))
+            used_positions.update(range(start, end))
+    
+    # Ищем формулы в формате \[...\] (блочные формулы LaTeX)
+    pattern_block_bracket = r'\\\[([^\]]+?)\\\]'
+    for match in re.finditer(pattern_block_bracket, text, re.DOTALL):
+        start, end = match.start(), match.end()
+        if not any(start <= pos < end for pos in used_positions):
+            formulas.append((match.group(1).strip(), start, end))
+            used_positions.update(range(start, end))
     
     # Ищем формулы в формате $...$ (инлайн формулы)
-    pattern_inline = r'\$([^$\n]+?)\$'
-    for match in re.finditer(pattern_inline, text):
+    pattern_inline_dollar = r'\$([^$\n]+?)\$'
+    for match in re.finditer(pattern_inline_dollar, text):
+        start, end = match.start(), match.end()
         # Проверяем, что это не часть блочной формулы
-        is_part_of_block = False
-        for block_start, block_end in [(m.start(), m.end()) for m in re.finditer(pattern_block, text, re.DOTALL)]:
-            if block_start <= match.start() < block_end:
-                is_part_of_block = True
-                break
-        if not is_part_of_block:
-            formulas.append((match.group(1).strip(), match.start(), match.end()))
+        if not any(start <= pos < end for pos in used_positions):
+            formulas.append((match.group(1).strip(), start, end))
+            used_positions.update(range(start, end))
     
+    # Ищем формулы в формате \(...\) (инлайн формулы LaTeX)
+    pattern_inline_paren = r'\\\(([^\)]+?)\\\)'
+    for match in re.finditer(pattern_inline_paren, text):
+        start, end = match.start(), match.end()
+        if not any(start <= pos < end for pos in used_positions):
+            formulas.append((match.group(1).strip(), start, end))
+            used_positions.update(range(start, end))
+    
+    # Сортируем по позиции начала
+    formulas.sort(key=lambda x: x[1])
+    
+    logger.debug(f"Найдено формул в тексте: {len(formulas)}")
     return formulas
 
 
@@ -252,6 +304,7 @@ async def send_message_with_latex(update: Update, context: ContextTypes.DEFAULT_
         return
     
     # Есть формулы, обрабатываем их
+    logger.info(f"Найдено формул: {len(formulas)}")
     last_pos = 0
     parts = []
     
@@ -261,12 +314,16 @@ async def send_message_with_latex(update: Update, context: ContextTypes.DEFAULT_
             parts.append(('text', text[last_pos:start]))
         
         # Рендерим формулу
+        logger.debug(f"Попытка отрендерить формулу: {formula[:50]}...")
         image = render_latex_to_image(formula)
         if image:
+            logger.info(f"Формула успешно отрендерена: {formula[:50]}...")
             parts.append(('image', (image, formula)))
         else:
-            # Если не удалось отрендерить, оставляем как текст
-            parts.append(('text', text[start:end]))
+            # Если не удалось отрендерить, отправляем как текст с пометкой
+            logger.warning(f"Не удалось отрендерить формулу, отправляем как текст: {formula[:50]}...")
+            # Отправляем формулу в читаемом виде
+            parts.append(('text', f"\\[{formula}\\]"))
         
         last_pos = end
     
@@ -303,10 +360,22 @@ async def send_message_with_latex(update: Update, context: ContextTypes.DEFAULT_
             image_io, formula_text = content
             try:
                 image_io.seek(0)
+                # Проверяем, что это действительно изображение
+                image_data = image_io.read()
+                if len(image_data) < 100:
+                    raise ValueError("Изображение слишком маленькое")
+                image_io.seek(0)
                 await update.message.reply_photo(photo=image_io)
+                logger.info(f"Изображение формулы успешно отправлено: {formula_text[:50]}...")
             except Exception as e:
                 logger.error(f"Ошибка при отправке изображения LaTeX: {str(e)}")
-                await update.message.reply_text(f"Формула: ${formula_text}$")
+                logger.error(f"Трассировка: {traceback.format_exc()}")
+                # Отправляем формулу как текст с правильным форматированием
+                try:
+                    await update.message.reply_text(f"\\[{formula_text}\\]", parse_mode='MarkdownV2')
+                except:
+                    # Если MarkdownV2 не работает, отправляем как обычный текст
+                    await update.message.reply_text(f"Формула: {formula_text}")
             time.sleep(0.3)
     
     # Отправляем оставшийся текст
