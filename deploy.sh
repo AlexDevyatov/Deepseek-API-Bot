@@ -54,8 +54,16 @@ mkdir -p $APP_DIR
 
 # Копируем файлы проекта
 echo -e "${YELLOW}Копирование файлов проекта...${NC}"
-cp "$SCRIPT_DIR/bot.py" "$SCRIPT_DIR/deepseek_client.py" "$SCRIPT_DIR/requirements.txt" $APP_DIR/
-chown -R $SERVICE_USER:$SERVICE_USER $APP_DIR
+if ! cp "$SCRIPT_DIR/bot.py" "$SCRIPT_DIR/deepseek_client.py" "$SCRIPT_DIR/requirements.txt" $APP_DIR/; then
+    echo -e "${RED}Ошибка при копировании файлов проекта${NC}"
+    exit 1
+fi
+
+if ! chown -R $SERVICE_USER:$SERVICE_USER $APP_DIR; then
+    echo -e "${RED}Ошибка при изменении владельца файлов${NC}"
+    exit 1
+fi
+echo -e "${GREEN}Файлы скопированы и права установлены${NC}"
 
 # Проверяем наличие tokens.txt
 if [ ! -f "$APP_DIR/tokens.txt" ]; then
@@ -86,23 +94,60 @@ fi
 
 # Создаем виртуальное окружение
 echo -e "${YELLOW}Создание виртуального окружения...${NC}"
-cd $APP_DIR
+cd $APP_DIR || exit 1
 if [ -d ".venv" ]; then
     echo -e "${YELLOW}Виртуальное окружение уже существует, пропускаем создание...${NC}"
 else
-    sudo -u $SERVICE_USER python3 -m venv .venv
+    echo -e "${YELLOW}Создание нового виртуального окружения...${NC}"
+    if ! sudo -u $SERVICE_USER python3 -m venv .venv; then
+        echo -e "${RED}Ошибка при создании виртуального окружения${NC}"
+        exit 1
+    fi
+    echo -e "${GREEN}Виртуальное окружение создано успешно${NC}"
 fi
 
 # Устанавливаем зависимости
 echo -e "${YELLOW}Установка зависимостей...${NC}"
-sudo -u $SERVICE_USER $APP_DIR/.venv/bin/pip install --upgrade pip --quiet
-sudo -u $SERVICE_USER $APP_DIR/.venv/bin/pip install -r $APP_DIR/requirements.txt --quiet
+if [ ! -f "$APP_DIR/.venv/bin/pip" ]; then
+    echo -e "${RED}Ошибка: pip не найден в виртуальном окружении${NC}"
+    exit 1
+fi
+
+if ! sudo -u $SERVICE_USER $APP_DIR/.venv/bin/pip install --upgrade pip --quiet; then
+    echo -e "${RED}Ошибка при обновлении pip${NC}"
+    exit 1
+fi
+
+if ! sudo -u $SERVICE_USER $APP_DIR/.venv/bin/pip install -r $APP_DIR/requirements.txt --quiet 2>/dev/null; then
+    echo -e "${YELLOW}Установка зависимостей с выводом прогресса...${NC}"
+    if ! sudo -u $SERVICE_USER $APP_DIR/.venv/bin/pip install -r $APP_DIR/requirements.txt; then
+        echo -e "${RED}Ошибка при установке зависимостей${NC}"
+        exit 1
+    fi
+fi
+echo -e "${GREEN}Зависимости установлены успешно${NC}"
 
 # Копируем и настраиваем systemd service
 echo -e "${YELLOW}Настройка systemd service...${NC}"
-cp "$SCRIPT_DIR/$SERVICE_FILE" /etc/systemd/system/
-systemctl daemon-reload
-systemctl enable $SERVICE_NAME
+if [ ! -f "$SCRIPT_DIR/$SERVICE_FILE" ]; then
+    echo -e "${RED}Ошибка: файл $SERVICE_FILE не найден${NC}"
+    exit 1
+fi
+
+if ! cp "$SCRIPT_DIR/$SERVICE_FILE" /etc/systemd/system/; then
+    echo -e "${RED}Ошибка при копировании service файла${NC}"
+    exit 1
+fi
+
+if ! systemctl daemon-reload; then
+    echo -e "${RED}Ошибка при перезагрузке systemd${NC}"
+    exit 1
+fi
+
+if ! systemctl enable $SERVICE_NAME; then
+    echo -e "${RED}Ошибка при включении автозапуска сервиса${NC}"
+    exit 1
+fi
 
 echo -e "${GREEN}=========================================="
 echo "Развертывание завершено!"
@@ -114,4 +159,14 @@ echo "2. Запустите бота командой: sudo systemctl start aibo
 echo "3. Проверьте статус: sudo systemctl status aibot"
 echo "4. Просмотр логов: sudo journalctl -u aibot -f"
 echo ""
+
+# Проверяем, что все файлы на месте
+echo -e "${YELLOW}Проверка установленных файлов...${NC}"
+if [ -f "$APP_DIR/bot.py" ] && [ -f "$APP_DIR/requirements.txt" ] && [ -d "$APP_DIR/.venv" ]; then
+    echo -e "${GREEN}✓ Все файлы на месте${NC}"
+else
+    echo -e "${RED}⚠ Некоторые файлы отсутствуют${NC}"
+fi
+
+exit 0
 
