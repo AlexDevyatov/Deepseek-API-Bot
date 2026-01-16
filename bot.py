@@ -97,7 +97,7 @@ def call_deepseek_api(messages: List[Dict], max_retries: int = 3, temperature: f
                 messages=messages,
                 stream=False,
                 temperature=temperature,
-                timeout=60.0
+                timeout=120.0  # Увеличено до 120 секунд для сложных задач
             )
             return response.choices[0].message.content
         except RateLimitError as e:
@@ -644,60 +644,105 @@ async def run_experiment(update: Update, context: ContextTypes.DEFAULT_TYPE, tas
     
     try:
         # Метод 1: Прямой ответ
-        await context.bot.edit_message_text(
-            chat_id=update.effective_chat.id,
-            message_id=status_message.message_id,
-            text="🔬 Эксперимент в процессе...\n\n"
-                 "✅ Метод 1: Прямой ответ - выполнен\n"
-                 "⏳ Метод 2: Пошаговое решение - выполняется...\n"
-                 "⏳ Метод 3: Промпт от другого ИИ - ожидание\n"
-                 "⏳ Метод 4: Группа экспертов - ожидание"
-        )
-        result1 = method1_direct_answer(task)
-        results.append(result1)
+        try:
+            await context.bot.edit_message_text(
+                chat_id=update.effective_chat.id,
+                message_id=status_message.message_id,
+                text="🔬 Эксперимент в процессе...\n\n"
+                     "⏳ Метод 1: Прямой ответ - выполняется...\n"
+                     "⏳ Метод 2: Пошаговое решение - ожидание\n"
+                     "⏳ Метод 3: Промпт от другого ИИ - ожидание\n"
+                     "⏳ Метод 4: Группа экспертов - ожидание"
+            )
+            result1 = method1_direct_answer(task)
+            results.append(result1)
+        except Exception as e:
+            logger.error(f"Ошибка в методе 1: {str(e)}")
+            logger.error(f"Трассировка: {traceback.format_exc()}")
+            results.append({
+                "method": "Прямой ответ",
+                "description": "Модель дает ответ напрямую без дополнительных инструкций",
+                "response": f"❌ Ошибка при выполнении метода: {str(e)}"
+            })
         
         # Метод 2: Пошаговое решение
-        await context.bot.edit_message_text(
-            chat_id=update.effective_chat.id,
-            message_id=status_message.message_id,
-            text="🔬 Эксперимент в процессе...\n\n"
-                 "✅ Метод 1: Прямой ответ - выполнен\n"
-                 "✅ Метод 2: Пошаговое решение - выполнен\n"
-                 "⏳ Метод 3: Промпт от другого ИИ - выполняется...\n"
-                 "⏳ Метод 4: Группа экспертов - ожидание"
-        )
-        result2 = method2_step_by_step(task)
-        results.append(result2)
+        try:
+            await context.bot.edit_message_text(
+                chat_id=update.effective_chat.id,
+                message_id=status_message.message_id,
+                text="🔬 Эксперимент в процессе...\n\n"
+                     "✅ Метод 1: Прямой ответ - выполнен\n"
+                     "⏳ Метод 2: Пошаговое решение - выполняется...\n"
+                     "⏳ Метод 3: Промпт от другого ИИ - ожидание\n"
+                     "⏳ Метод 4: Группа экспертов - ожидание"
+            )
+            result2 = method2_step_by_step(task)
+            results.append(result2)
+        except Exception as e:
+            logger.error(f"Ошибка в методе 2: {str(e)}")
+            logger.error(f"Трассировка: {traceback.format_exc()}")
+            results.append({
+                "method": "Пошаговое решение",
+                "description": "Модель решает задачу пошагово, объясняя каждый шаг",
+                "response": f"❌ Ошибка при выполнении метода: {str(e)}"
+            })
         
         # Метод 3: Промпт от другого ИИ
-        await context.bot.edit_message_text(
-            chat_id=update.effective_chat.id,
-            message_id=status_message.message_id,
-            text="🔬 Эксперимент в процессе...\n\n"
-                 "✅ Метод 1: Прямой ответ - выполнен\n"
-                 "✅ Метод 2: Пошаговое решение - выполнен\n"
-                 "✅ Метод 3: Промпт от другого ИИ - выполнен\n"
-                 "⏳ Метод 4: Группа экспертов - выполняется..."
-        )
-        result3 = method3_ai_prompt(task)
-        results.append(result3)
+        try:
+            await context.bot.edit_message_text(
+                chat_id=update.effective_chat.id,
+                message_id=status_message.message_id,
+                text="🔬 Эксперимент в процессе...\n\n"
+                     "✅ Метод 1: Прямой ответ - выполнен\n"
+                     "✅ Метод 2: Пошаговое решение - выполнен\n"
+                     "⏳ Метод 3: Промпт от другого ИИ - выполняется...\n"
+                     "⏳ Метод 4: Группа экспертов - ожидание"
+            )
+            result3 = method3_ai_prompt(task)
+            results.append(result3)
+        except Exception as e:
+            logger.error(f"Ошибка в методе 3: {str(e)}")
+            logger.error(f"Трассировка: {traceback.format_exc()}")
+            results.append({
+                "method": "Промпт от другого ИИ",
+                "description": "Другой ИИ создает промпт, затем основной ИИ решает задачу",
+                "response": f"❌ Ошибка при выполнении метода: {str(e)}",
+                "prompt_created": "N/A"
+            })
         
         # Метод 4: Группа экспертов
-        await context.bot.edit_message_text(
-            chat_id=update.effective_chat.id,
-            message_id=status_message.message_id,
-            text="🔬 Эксперимент в процессе...\n\n"
-                 "✅ Метод 1: Прямой ответ - выполнен\n"
-                 "✅ Метод 2: Пошаговое решение - выполнен\n"
-                 "✅ Метод 3: Промпт от другого ИИ - выполнен\n"
-                 "✅ Метод 4: Группа экспертов - выполнен\n\n"
-                 "⏳ Сравнение результатов..."
-        )
-        result4 = method4_expert_panel(task)
-        results.append(result4)
+        try:
+            await context.bot.edit_message_text(
+                chat_id=update.effective_chat.id,
+                message_id=status_message.message_id,
+                text="🔬 Эксперимент в процессе...\n\n"
+                     "✅ Метод 1: Прямой ответ - выполнен\n"
+                     "✅ Метод 2: Пошаговое решение - выполнен\n"
+                     "✅ Метод 3: Промпт от другого ИИ - выполнен\n"
+                     "⏳ Метод 4: Группа экспертов - выполняется..."
+            )
+            result4 = method4_expert_panel(task)
+            results.append(result4)
+        except Exception as e:
+            logger.error(f"Ошибка в методе 4: {str(e)}")
+            logger.error(f"Трассировка: {traceback.format_exc()}")
+            results.append({
+                "method": "Группа экспертов",
+                "description": "Группа экспертов решает задачу, затем их ответы синтезируются",
+                "response": f"❌ Ошибка при выполнении метода: {str(e)}",
+                "expert_responses": [],
+                "final_response": "N/A"
+            })
         
         # Сравнение результатов
-        comparison = compare_results(task, results)
+        try:
+            comparison = compare_results(task, results)
+            if not comparison or comparison == "Ошибка при сравнении результатов":
+                comparison = "Не удалось выполнить сравнение результатов из-за ошибки API."
+        except Exception as e:
+            logger.error(f"Ошибка при сравнении результатов: {str(e)}")
+            logger.error(f"Трассировка: {traceback.format_exc()}")
+            comparison = f"❌ Ошибка при сравнении результатов: {str(e)}"
         
         # Формируем финальный отчет
         report = "=" * 60 + "\n"
@@ -741,16 +786,31 @@ async def run_experiment(update: Update, context: ContextTypes.DEFAULT_TYPE, tas
         await send_message_with_latex(update, context, report)
         
     except Exception as e:
-        logger.error(f"Ошибка в эксперименте: {str(e)}")
+        logger.error(f"Критическая ошибка в эксперименте: {str(e)}")
         logger.error(f"Трассировка: {traceback.format_exc()}")
         try:
+            error_msg = (
+                "❌ Произошла критическая ошибка при выполнении эксперимента.\n\n"
+                f"Ошибка: {str(e)}\n\n"
+                "Пожалуйста, попробуйте:\n"
+                "• Проверить подключение к интернету\n"
+                "• Попробовать еще раз через несколько секунд\n"
+                "• Отправить задачу заново"
+            )
             await context.bot.edit_message_text(
                 chat_id=update.effective_chat.id,
                 message_id=status_message.message_id,
-                text=f"❌ Произошла ошибка при выполнении эксперимента: {str(e)}"
+                text=error_msg
             )
-        except:
-            await update.message.reply_text(f"❌ Произошла ошибка при выполнении эксперимента: {str(e)}")
+        except Exception as edit_error:
+            logger.error(f"Не удалось отредактировать сообщение об ошибке: {str(edit_error)}")
+            try:
+                await update.message.reply_text(
+                    "❌ Произошла критическая ошибка при выполнении эксперимента. "
+                    "Пожалуйста, попробуйте позже или отправьте задачу заново."
+                )
+            except:
+                pass
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):

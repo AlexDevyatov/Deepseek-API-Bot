@@ -58,11 +58,41 @@ fi
 # Останавливаем сервис
 if [ "$SERVICE_WAS_RUNNING" = true ]; then
     echo -e "${YELLOW}Остановка сервиса $SERVICE_NAME...${NC}"
+    
+    # Пытаемся остановить сервис
     if systemctl stop $SERVICE_NAME; then
         echo -e "${GREEN}Сервис остановлен${NC}"
     else
-        echo -e "${RED}Ошибка при остановке сервиса${NC}"
-        exit 1
+        echo -e "${YELLOW}Обычная остановка не удалась, ждем завершения процесса...${NC}"
+        # Ждем до 10 секунд, пока процесс завершится
+        for i in {1..10}; do
+            if ! systemctl is-active --quiet $SERVICE_NAME; then
+                echo -e "${GREEN}Сервис остановлен${NC}"
+                break
+            fi
+            sleep 1
+        done
+        
+        # Если процесс все еще работает, используем более агрессивный метод
+        if systemctl is-active --quiet $SERVICE_NAME; then
+            echo -e "${YELLOW}Принудительная остановка сервиса...${NC}"
+            systemctl kill --kill-who=main --signal=SIGKILL $SERVICE_NAME 2>/dev/null || true
+            sleep 2
+            
+            # Проверяем, остановился ли сервис
+            if systemctl is-active --quiet $SERVICE_NAME; then
+                echo -e "${RED}Не удалось остановить сервис. Попробуйте остановить вручную: sudo systemctl stop $SERVICE_NAME${NC}"
+                exit 1
+            else
+                echo -e "${GREEN}Сервис остановлен принудительно${NC}"
+            fi
+        fi
+    fi
+    
+    # Дополнительная проверка, что сервис действительно остановлен
+    sleep 1
+    if systemctl is-active --quiet $SERVICE_NAME; then
+        echo -e "${RED}Предупреждение: Сервис все еще активен после остановки${NC}"
     fi
     echo ""
 fi
